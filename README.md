@@ -57,6 +57,16 @@ Test data:     input/waveform-inversion/test
 Outputs:       output
 ```
 
+The data root is resolved in this order:
+
+1. `WAVEFORM_DATA_ROOT`, when set
+2. The local project path `input/waveform-inversion`
+3. A valid dataset directory under `/kaggle/input`
+4. A valid dataset directory under `/kaggle/competition`
+5. The local project path as a deferred fallback for model-only tests
+
+`WAVEFORM_OUTPUT_ROOT` can be used to override the output directory. Otherwise
+`/kaggle/working` is used when available, and local runs use `output`.
 Command-line arguments override the relevant defaults, which makes the same
 scripts usable with Kaggle paths.
 
@@ -90,7 +100,9 @@ output/submission.csv
 
 ## Kaggle Usage
 
-When the competition data is mounted under `/kaggle/input`, pass Kaggle paths
+When the competition data is mounted under `/kaggle/input` or
+`/kaggle/competition`, the configuration attempts to detect it automatically.
+For a non-standard mount, set `WAVEFORM_DATA_ROOT` or pass Kaggle paths
 explicitly:
 
 ```python
