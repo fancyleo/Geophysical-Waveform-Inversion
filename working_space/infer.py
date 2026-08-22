@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 
 import sys
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from working_space.train import UNet, Cfg   # Reuse the model and shared configuration.
 
 # ---------------------------------------------------------------------------
