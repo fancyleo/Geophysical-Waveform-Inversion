@@ -19,7 +19,7 @@ Kaggle competition. The model maps five-source seismic measurements to a
 │   ├── compute_stats.py  # Velocity normalization statistics
 │   ├── test_unet.py      # U-Net forward/backward smoke test
 │   └── smoke_test.py     # Data pairing and submission format test
-└── output/               # Default checkpoints and submissions
+└── output/               # Training run artifacts
 ```
 
 ## Data Format
@@ -98,12 +98,25 @@ configured family names. Omitting it or using `all` trains on every family.
 When a family is selected and no `--out_dir` is provided, results are written
 to a matching subdirectory under `output` to avoid overwriting another run.
 
-The default outputs are:
+Each training command creates a timestamped run directory under the selected
+output root. The directory name is `model_YYMMDD_HHMM`; a numeric suffix is
+added if the same minute is used more than once. A run contains:
 
 ```text
-output/best_unet.pth
-output/history.json
-output/submission.csv
+output/model_YYMMDD_HHMM/
+├── best_unet.pth       # Weights from the best validation epoch
+├── config.json         # Effective arguments and shared configuration
+├── history.json        # Per-epoch normalized and raw-unit MAE
+├── mae_curve.png       # Normalized and raw-unit MAE curves
+└── results.json        # Dataset, model, timing, and best-result summary
+```
+
+The output directory can be changed with `--out_dir` or
+`WAVEFORM_OUTPUT_ROOT`. Pass the resulting checkpoint explicitly to inference:
+
+```powershell
+python working_space/infer.py \
+    --ckpt output/model_YYMMDD_HHMM/best_unet.pth
 ```
 
 ## Kaggle Usage

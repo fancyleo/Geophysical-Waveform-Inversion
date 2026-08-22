@@ -6,16 +6,19 @@ Expected data layout (Kaggle input or local):
   input_dir/
     FlatVel_A/data/*.npy  (500, 5, 1000, 70)
     FlatVel_A/model/*.npy (500, 70, 70)
-    FlatFault_A/seis_*.npy
-    FlatFault_A/vel_*.npy
+    FlatFault_A/seis*.npy
+    FlatFault_A/vel*.npy
     ...
     test/{oid}.npy        (5, 1000, 70) per file
 
 Submission format: one row per oid/y position with odd x-columns only.
 """
 
-import os, glob, json, argparse
+import os, glob, json, argparse, time
+from datetime import datetime
+from pathlib import Path
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -52,17 +55,23 @@ def find_pairs(root, families=None):
                     pairs.append((sf, mf))
             continue
 
-        # Fault families store matching seis*.npy and vel*.npy files together.
-        seis_files = sorted(glob.glob(os.path.join(fam_dir, "seis*.npy")))
-        for sf in seis_files:
-            base = os.path.basename(sf)
-            if not base.lower().startswith("seis"):
-                continue
-            vf = os.path.join(fam_dir, "vel" + base[4:])
-            if os.path.exists(vf):
-                pairs.append((sf, vf))
+        pairs.extend(find_fault_pairs(fam_dir))
 
     print(f"[info] total paired files: {len(pairs)}")
+    return pairs
+
+
+def find_fault_pairs(family_dir):
+    """Find recursive same-directory pairs such as ``seis2.npy`` and ``vel2.npy``."""
+    pairs = []
+    pattern = os.path.join(family_dir, "**", "seis*.npy")
+    for seismic_path in sorted(glob.glob(pattern, recursive=True)):
+        filename = os.path.basename(seismic_path)
+        velocity_path = os.path.join(
+            os.path.dirname(seismic_path), "vel" + filename[4:]
+        )
+        if os.path.isfile(velocity_path):
+            pairs.append((seismic_path, velocity_path))
     return pairs
 
 
@@ -257,6 +266,50 @@ def validate(model, loader, criterion, device):
     return total / max(n, 1)
 
 
+def create_run_dir(output_root):
+    """Create a timestamped directory for one training run's artifacts."""
+    timestamp = datetime.now().strftime("%y%m%d_%H%M")
+    run_dir = Path(output_root) / f"model_{timestamp}"
+    suffix = 1
+    while run_dir.exists():
+        run_dir = Path(output_root) / f"model_{timestamp}_{suffix:02d}"
+        suffix += 1
+    run_dir.mkdir(parents=True)
+    return run_dir
+
+
+def save_json(path, data):
+    """Write JSON data while converting pathlib values to strings."""
+    with open(path, "w") as file:
+        json.dump(data, file, indent=2, default=str)
+
+
+def save_mae_curve(history, path):
+    """Save normalized and raw train/validation MAE curves as a PNG."""
+    epochs = [item["epoch"] for item in history]
+    figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+    axes[0].plot(epochs, [item["train_mae_norm"] for item in history], label="train")
+    axes[0].plot(epochs, [item["val_mae_norm"] for item in history], label="validation")
+    axes[0].set_title("Normalized MAE")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("MAE")
+    axes[0].grid(alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(epochs, [item["train_mae_raw"] for item in history], label="train")
+    axes[1].plot(epochs, [item["val_mae_raw"] for item in history], label="validation")
+    axes[1].set_title("Raw-unit MAE")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("MAE")
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
 # ---------------------------------------------------------------------------
 # Command-line entry point
 # ---------------------------------------------------------------------------
@@ -277,7 +330,8 @@ def main():
     if args.family and args.out_dir == str(Cfg.output_dir):
         output_name = args.family.strip().lower().replace(",", "_")
         args.out_dir = os.path.join(args.out_dir, output_name)
-    os.makedirs(args.out_dir, exist_ok=True)
+    run_dir = create_run_dir(args.out_dir)
+    run_started_at = time.perf_counter()
 
     torch.manual_seed(Cfg.seed)
     np.random.seed(Cfg.seed)
@@ -318,6 +372,7 @@ def main():
     criterion = nn.L1Loss()  # MAE in normalized target units.
 
     best_val = float("inf")
+    best_epoch = None
     history = []
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, Cfg.device)
@@ -340,12 +395,39 @@ def main():
         )
         if va_loss < best_val:
             best_val = va_loss
-            torch.save(model.state_dict(), os.path.join(args.out_dir, "best_unet.pth"))
+            best_epoch = epoch
+            torch.save(model.state_dict(), run_dir / "best_unet.pth")
             print(f"  saved best (val_mae_raw={val_mae_raw:.2f})")
 
-    with open(os.path.join(args.out_dir, "history.json"), "w") as f:
-        json.dump(history, f, indent=2)
+    elapsed_seconds = time.perf_counter() - run_started_at
+    save_json(run_dir / "history.json", history)
+    save_mae_curve(history, run_dir / "mae_curve.png")
+    save_json(run_dir / "config.json", {
+        "arguments": vars(args),
+        "selected_families": selected_families,
+        "config": {
+            key: value for key, value in vars(Cfg).items()
+            if not key.startswith("__") and not callable(value)
+        },
+    })
+    save_json(run_dir / "results.json", {
+        "run_dir": run_dir,
+        "device": Cfg.device,
+        "model": "UNet",
+        "model_base_channels": Cfg.model_base_channels,
+        "parameter_count": n_params,
+        "train_files": len(tr_files),
+        "validation_files": len(va_files),
+        "train_samples": len(tr_idx),
+        "validation_samples": len(va_idx),
+        "epochs_completed": len(history),
+        "best_epoch": best_epoch,
+        "best_val_mae_norm": best_val,
+        "best_val_mae_raw": best_val * Cfg.vel_std,
+        "elapsed_seconds": elapsed_seconds,
+    })
     print(f"[done] best val_mae_raw = {best_val * Cfg.vel_std:.2f}")
+    print(f"[done] run artifacts saved to {run_dir}")
 
 
 if __name__ == "__main__":

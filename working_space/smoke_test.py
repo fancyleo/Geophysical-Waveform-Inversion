@@ -52,8 +52,9 @@ def find_pairs(root, families):
                 mf = os.path.join(m, os.path.basename(sf).replace("data","model"))
                 if os.path.exists(mf): pairs.append((sf, mf))
             continue
-        for sf in sorted(glob.glob(os.path.join(fam_dir,"seis_*.npy"))):
-            vf = os.path.join(fam_dir, os.path.basename(sf).replace("seis_","vel_"))
+        for sf in sorted(glob.glob(os.path.join(fam_dir, "**", "seis*.npy"), recursive=True)):
+            filename = os.path.basename(sf)
+            vf = os.path.join(os.path.dirname(sf), "vel" + filename[4:])
             if os.path.exists(vf): pairs.append((sf, vf))
     return pairs
 

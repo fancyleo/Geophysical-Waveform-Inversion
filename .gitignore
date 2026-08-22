@@ -12,5 +12,8 @@ wheels/
 # Input data files
 input/*
 
-# test notebook
+# Test notebook
 working_space/test.ipynb
+
+# Outputs
+output/
