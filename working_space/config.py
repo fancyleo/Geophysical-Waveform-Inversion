@@ -54,6 +54,25 @@ def resolve_output_root(project_root):
     return project_root / "output"
 
 
+def select_families(query=None):
+    """Select configured data families using a case-insensitive keyword."""
+    if query is None or not query.strip() or query.strip().lower() == "all":
+        return list(Cfg.families)
+
+    requested = [item.strip().lower() for item in query.split(",") if item.strip()]
+    selected = [
+        family
+        for family in Cfg.families
+        if any(keyword in family.lower() for keyword in requested)
+    ]
+    if not selected:
+        available = ", ".join(Cfg.families)
+        raise ValueError(
+            f"No family matched '{query}'. Available families: {available}"
+        )
+    return selected
+
+
 class Cfg:
     """Shared paths, dataset settings, model hyperparameters, and test options."""
 

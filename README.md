@@ -30,8 +30,8 @@ The training data is expected to contain paired seismic and velocity files:
 train_samples/
 ├── FlatVel_A/data/*.npy
 ├── FlatVel_A/model/*.npy
-├── FlatFault_A/seis_*.npy
-├── FlatFault_A/vel_*.npy
+├── FlatFault_A/seis*.npy
+├── FlatFault_A/vel*.npy
 └── ...
 ```
 
@@ -88,7 +88,15 @@ To override selected settings:
 ```powershell
 python working_space/train.py --epochs 30 --batch_size 8
 python working_space/infer.py --batch_size 4
+python working_space/train.py --family flatfault_a
+python working_space/train.py --family fault
+python working_space/train.py --family flatfault_a,curvevel_a
 ```
+
+The `--family` option performs case-insensitive substring matching against the
+configured family names. Omitting it or using `all` trains on every family.
+When a family is selected and no `--out_dir` is provided, results are written
+to a matching subdirectory under `output` to avoid overwriting another run.
 
 The default outputs are:
 
@@ -146,7 +154,8 @@ For each test object, the inference script writes 70 rows named
 
 ## Notes
 
-- The training loss is L1 loss on normalized velocity maps.
+- The training loss is L1 loss on normalized velocity maps. Training logs also
+    report `val_mae_raw` in the original velocity units.
 - The seismic input is transformed with `log1p(abs(x))`.
 - Training uses a file-level train/validation split to reduce leakage between
   samples from the same file.

@@ -21,7 +21,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
-from config import Cfg
+from config import Cfg, select_families
 
 if Cfg.device == "auto":
     Cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -29,10 +29,11 @@ if Cfg.device == "auto":
 # ---------------------------------------------------------------------------
 # Data loading utilities
 # ---------------------------------------------------------------------------
-def find_pairs(root):
-    """Find paired seismic and velocity files under all configured families."""
+def find_pairs(root, families=None):
+    """Find paired seismic and velocity files for the selected families."""
+    families = Cfg.families if families is None else families
     pairs = []
-    for fam in Cfg.families:
+    for fam in families:
         fam_dir = os.path.join(root, fam)
         if not os.path.isdir(fam_dir):
             print(f"[warn] missing family dir: {fam_dir}")
@@ -51,11 +52,13 @@ def find_pairs(root):
                     pairs.append((sf, mf))
             continue
 
-        # Fault families store seismic and velocity files in the same folder.
-        seis_files = sorted(glob.glob(os.path.join(fam_dir, "seis_*.npy")))
+        # Fault families store matching seis*.npy and vel*.npy files together.
+        seis_files = sorted(glob.glob(os.path.join(fam_dir, "seis*.npy")))
         for sf in seis_files:
             base = os.path.basename(sf)
-            vf = os.path.join(fam_dir, base.replace("seis_", "vel_"))
+            if not base.lower().startswith("seis"):
+                continue
+            vf = os.path.join(fam_dir, "vel" + base[4:])
             if os.path.exists(vf):
                 pairs.append((sf, vf))
 
@@ -264,20 +267,32 @@ def main():
     parser.add_argument("--out_dir",  default=str(Cfg.output_dir))
     parser.add_argument("--epochs",   type=int, default=Cfg.epochs)
     parser.add_argument("--batch_size", type=int, default=Cfg.batch_size)
+    parser.add_argument(
+        "--family",
+        default=None,
+        help="Case-insensitive family keyword(s), comma-separated, or 'all'.",
+    )
     args = parser.parse_args()
+    selected_families = select_families(args.family)
+    if args.family and args.out_dir == str(Cfg.output_dir):
+        output_name = args.family.strip().lower().replace(",", "_")
+        args.out_dir = os.path.join(args.out_dir, output_name)
     os.makedirs(args.out_dir, exist_ok=True)
 
     torch.manual_seed(Cfg.seed)
     np.random.seed(Cfg.seed)
 
     # Collect paired training files and build a file-level split.
-    pairs = find_pairs(args.data_dir)
+    print(f"[info] selected families: {', '.join(selected_families)}")
+    pairs = find_pairs(args.data_dir, selected_families)
     if len(pairs) == 0:
         raise RuntimeError("No paired data files found; check the --data_dir path")
 
     indices = build_flat_indices(pairs)
     # Split at file level to reduce leakage between samples from one file.
     file_ids = list(range(len(pairs)))
+    if len(file_ids) < 2:
+        raise ValueError("At least two data files are required for a train/validation split")
     tr_files, va_files = train_test_split(
         file_ids, test_size=Cfg.val_ratio, random_state=Cfg.seed
     )
@@ -300,7 +315,7 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=Cfg.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = nn.L1Loss()  # MAE，与比赛指标一致
+    criterion = nn.L1Loss()  # MAE in normalized target units.
 
     best_val = float("inf")
     history = []
@@ -308,16 +323,29 @@ def main():
         tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, Cfg.device)
         va_loss = validate(model, val_loader, criterion, Cfg.device)
         scheduler.step()
-        history.append({"epoch": epoch, "train_mae": tr_loss, "val_mae": va_loss})
-        print(f"epoch {epoch:03d}  train_mae={tr_loss:.3f}  val_mae={va_loss:.3f}")
+        train_mae_raw = tr_loss * Cfg.vel_std
+        val_mae_raw = va_loss * Cfg.vel_std
+        history.append({
+            "epoch": epoch,
+            "train_mae_norm": tr_loss,
+            "val_mae_norm": va_loss,
+            "train_mae_raw": train_mae_raw,
+            "val_mae_raw": val_mae_raw,
+        })
+        print(
+            f"epoch {epoch:03d}  "
+            f"train_mae_norm={tr_loss:.4f}  "
+            f"val_mae_norm={va_loss:.4f}  "
+            f"val_mae_raw={val_mae_raw:.2f}"
+        )
         if va_loss < best_val:
             best_val = va_loss
             torch.save(model.state_dict(), os.path.join(args.out_dir, "best_unet.pth"))
-            print(f"  ✓ saved best (val_mae={va_loss:.3f})")
+            print(f"  saved best (val_mae_raw={val_mae_raw:.2f})")
 
     with open(os.path.join(args.out_dir, "history.json"), "w") as f:
         json.dump(history, f, indent=2)
-    print(f"[done] best val_mae = {best_val:.3f}")
+    print(f"[done] best val_mae_raw = {best_val * Cfg.vel_std:.2f}")
 
 
 if __name__ == "__main__":

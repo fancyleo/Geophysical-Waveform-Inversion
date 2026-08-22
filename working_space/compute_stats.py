@@ -11,20 +11,33 @@ Usage:
 import os, glob, argparse
 import numpy as np
 from tqdm.auto import tqdm
-from config import Cfg
+from config import Cfg, select_families
 
 def main():
     """Compute summary statistics for all velocity files under the data root."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default=str(Cfg.train_data_dir))
+    parser.add_argument(
+        "--family",
+        default=None,
+        help="Case-insensitive family keyword(s), comma-separated, or 'all'.",
+    )
     args = parser.parse_args()
+    selected_families = select_families(args.family)
 
     files = []
     for root, _, fs in os.walk(args.data_dir):
         for f in fs:
-            if f.endswith(".npy") and ("model" in f or f.startswith("vel_")):
+            if f.endswith(".npy") and (
+                "model" in f.lower() or f.lower().startswith("vel")
+            ):
                 files.append(os.path.join(root, f))
     files = sorted(set(files))
+    files = [
+        path for path in files
+        if any(os.sep + family.lower() + os.sep in path.lower() for family in selected_families)
+    ]
+    print(f"[info] selected families: {', '.join(selected_families)}")
     print(f"[info] found {len(files)} velocity .npy files")
 
     vals = []
