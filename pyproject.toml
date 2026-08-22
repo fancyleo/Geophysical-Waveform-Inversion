@@ -1,0 +1,24 @@
+[project]
+name = "geophysical-waveform-inversion"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "fancyleo", email = "liulongxiaoleo@gmail.com" }
+]
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "jupyter>=1.1.1",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
+    "scikit-learn>=1.9.0",
+    "tqdm>=4.70.0",
+]
+
+[project.scripts]
+geophysical-waveform-inversion = "geophysical_waveform_inversion:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
