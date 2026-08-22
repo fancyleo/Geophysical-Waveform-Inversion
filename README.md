@@ -88,6 +88,7 @@ To override selected settings:
 
 ```powershell
 python working_space/train.py --epochs 30 --batch_size 8
+python working_space/train.py --parallel_mode data_parallel
 python working_space/infer.py --batch_size 4
 python working_space/train.py --family flatfault_a
 python working_space/train.py --family fault
@@ -119,6 +120,14 @@ The output directory can be changed with `--out_dir` or
 python working_space/infer.py \
     --ckpt output/model_YYMMDD_HHMM/best_unet.pth
 ```
+
+The training entry point supports `single` and `data_parallel` modes. In
+`data_parallel` mode, one GPU is used when only one is available and multiple
+CUDA GPUs are used through PyTorch `DataParallel` when available. Checkpoints
+are saved without the `module.` prefix, so they remain compatible with single-
+GPU inference. The `ddp` mode is reserved as a future distributed-training
+backend and currently reports an explicit error rather than silently running a
+different configuration.
 
 ## Kaggle Usage
 

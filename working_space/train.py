@@ -131,6 +131,34 @@ def build_flat_indices(pairs):
     return indices
 
 
+def resolve_parallel_mode(mode, device, gpu_count):
+    """Resolve the requested parallel mode against the available hardware."""
+    if mode not in {"single", "data_parallel", "ddp"}:
+        raise ValueError(f"Unsupported parallel mode: {mode}")
+    if mode == "ddp":
+        raise NotImplementedError(
+            "DDP is reserved for the distributed training entry point. "
+            "Use data_parallel for the current notebook workflow."
+        )
+    if mode == "data_parallel" and device.startswith("cuda") and gpu_count > 1:
+        return "data_parallel"
+    return "single"
+
+
+def wrap_model_for_parallel(model, mode, device):
+    """Wrap a model for the selected parallel backend."""
+    resolved_mode = resolve_parallel_mode(mode, device, torch.cuda.device_count())
+    if resolved_mode == "data_parallel":
+        print(f"[info] using DataParallel on {torch.cuda.device_count()} GPUs")
+        return nn.DataParallel(model), resolved_mode
+    return model, resolved_mode
+
+
+def unwrap_model(model):
+    """Return the underlying model from a parallel wrapper."""
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
 # ---------------------------------------------------------------------------
 # U-Net model: input (5, 1000, 70) -> output (1, 70, 70)
 # ---------------------------------------------------------------------------
@@ -321,6 +349,12 @@ def main():
     parser.add_argument("--epochs",   type=int, default=Cfg.epochs)
     parser.add_argument("--batch_size", type=int, default=Cfg.batch_size)
     parser.add_argument(
+        "--parallel_mode",
+        choices=("single", "data_parallel", "ddp"),
+        default=Cfg.parallel_mode,
+        help="Parallel backend; data_parallel supports the current multi-GPU workflow.",
+    )
+    parser.add_argument(
         "--family",
         default=None,
         help="Case-insensitive family keyword(s), comma-separated, or 'all'.",
@@ -381,6 +415,9 @@ def main():
 
     # Build the model, optimizer, scheduler, and loss function.
     model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(Cfg.device)
+    model, resolved_parallel_mode = wrap_model_for_parallel(
+        model, args.parallel_mode, Cfg.device
+    )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[info] model params: {n_params/1e6:.2f}M")
 
@@ -413,7 +450,7 @@ def main():
         if va_loss < best_val:
             best_val = va_loss
             best_epoch = epoch
-            torch.save(model.state_dict(), run_dir / "best_unet.pth")
+            torch.save(unwrap_model(model).state_dict(), run_dir / "best_unet.pth")
             print(f"  saved best (val_mae_raw={val_mae_raw:.2f})")
 
     elapsed_seconds = time.perf_counter() - run_started_at
@@ -441,6 +478,9 @@ def main():
     save_json(run_dir / "results.json", {
         "run_dir": run_dir,
         "device": Cfg.device,
+        "parallel_mode_requested": args.parallel_mode,
+        "parallel_mode_resolved": resolved_parallel_mode,
+        "gpu_count": torch.cuda.device_count() if Cfg.device.startswith("cuda") else 0,
         "model": "UNet",
         "model_base_channels": Cfg.model_base_channels,
         "parameter_count": n_params,
