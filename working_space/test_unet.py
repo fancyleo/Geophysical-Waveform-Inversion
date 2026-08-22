@@ -15,6 +15,7 @@ from config import Cfg
 
 
 def main():
+    """Verify the U-Net output shape and a complete backward pass."""
     model = UNet(in_ch=Cfg.n_src, base=Cfg.test_base_channels)
     inputs = torch.randn(
         Cfg.test_batch_size, Cfg.n_src, Cfg.n_steps, Cfg.n_recv

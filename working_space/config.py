@@ -4,7 +4,9 @@ from pathlib import Path
 
 
 class Cfg:
-    # Project-relative paths. Override these with CLI arguments for Kaggle paths.
+    """Shared paths, dataset settings, model hyperparameters, and test options."""
+
+    # Project-relative paths; override them with CLI arguments for Kaggle paths.
     project_root = Path(__file__).resolve().parents[1]
     input_root = project_root / "input" / "waveform-inversion"
     train_data_dir = input_root / "train_samples"
@@ -33,7 +35,7 @@ class Cfg:
     val_ratio = 0.1
     model_base_channels = 32
 
-    # Target normalization; replace with values from compute_stats.py
+    # Target normalization; replace these values with compute_stats.py output.
     vel_mean = 3500.0
     vel_std = 500.0
 
@@ -51,6 +53,6 @@ class Cfg:
     submission_x_start = 1
     submission_x_stop = 70
     submission_x_step = 2
-    # Shape smoke test
+    # Shape smoke-test settings
     test_batch_size = 2
     test_base_channels = 4

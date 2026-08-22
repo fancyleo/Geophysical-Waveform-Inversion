@@ -1,13 +1,13 @@
 """
 Yale/UNC-CH - Geophysical Waveform Inversion
-推理 + 生成 submission.csv
+Inference and submission generation script.
 
-用法（本地默认路径）:
+Usage (local default paths):
     python infer.py
 
-Kaggle 使用时通过 --ckpt、--test_dir 和 --out 覆盖默认路径。
+For Kaggle, override the default paths with --ckpt, --test_dir, and --out.
 
-输出格式（与 sample_submission.csv 一致）:
+Output format (matching sample_submission.csv):
   oid_ypos,x_1,x_3,...,x_69
   000039dca2_y_0,3000.0,3000.0,...,3000.0
   ...
@@ -23,38 +23,40 @@ from tqdm.auto import tqdm
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
-from working_space.train import UNet, Cfg   # 复用模型定义和配置
+from working_space.train import UNet, Cfg   # Reuse the model and shared configuration.
 
-# ─────────────────────────────────────────────
-# 1. 测试数据集
-# ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Test dataset
+# ---------------------------------------------------------------------------
 class TestDataset(Dataset):
-    """
-    每个 .npy 文件是一个完整 sample，shape (5, 1000, 70)
-    文件名为 oid（不含扩展名）
-    """
+    """Load one complete seismic sample from each NumPy file."""
+
     def __init__(self, test_dir):
+        """Index test files in the given directory and extract their object IDs."""
         self.files = sorted(glob.glob(os.path.join(test_dir, "*.npy")))
         if len(self.files) == 0:
-            raise RuntimeError(f"未在 {test_dir} 找到任何 .npy 文件")
+            raise RuntimeError(f"No .npy files found in {test_dir}")
         # 提取 oid
         self.oids = [os.path.splitext(os.path.basename(f))[0] for f in self.files]
         print(f"[info] test files: {len(self.files)}")
 
     def __len__(self):
+        """Return the number of test files."""
         return len(self.files)
 
     def __getitem__(self, i):
-        seis = np.load(self.files[i]).astype(np.float32)   # (5, 1000, 70)
-        seis = np.log1p(np.abs(seis))                     # 同训练预处理
+        """Load and preprocess one seismic sample."""
+        seis = np.load(self.files[i]).astype(np.float32)   # Shape: (5, 1000, 70).
+        seis = np.log1p(np.abs(seis))                     # Match the training transform.
         return self.oids[i], torch.from_numpy(seis)
 
 
-# ─────────────────────────────────────────────
-# 2. 主推理
-# ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Inference entry point
+# ---------------------------------------------------------------------------
 @torch.no_grad()
 def main():
+    """Run inference and write predictions in Kaggle submission format."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt",     default=str(Cfg.checkpoint_path))
     parser.add_argument("--test_dir", default=str(Cfg.test_data_dir))
@@ -70,22 +72,22 @@ def main():
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
 
-    # 2.1 加载模型
+    # Load the trained model.
     model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(device)
     state = torch.load(args.ckpt, map_location=device)
     model.load_state_dict(state)
     model.eval()
     print(f"[info] loaded checkpoint: {args.ckpt}")
 
-    # 2.2 数据
+    # Prepare the test data loader.
     ds = TestDataset(args.test_dir)
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False, num_workers=Cfg.num_workers
     )
 
-    # 2.3 推理
+    # Generate velocity predictions.
     oid_list = []
-    preds = []   # 存 (B, 70, 70) 反归一化后的速度图
+    preds = []   # Store denormalized predictions with shape (B, 70, 70).
     for oids, seis in tqdm(loader, desc="inference"):
         seis = seis.to(device)                     # (B,5,1000,70)
         pred = model(seis)                         # (B,70,70)
@@ -96,8 +98,7 @@ def main():
     preds = np.concatenate(preds, axis=0)          # (N, 70, 70)
     print(f"[info] predictions shape: {preds.shape}")
 
-    # 2.4 写 submission
-    # 只取奇数列: x_1, x_3, ..., x_69  → 索引 1,3,...,69
+    # Write the submission using only odd x-columns.
     odd_cols = preds[:, :, Cfg.submission_x_start:Cfg.submission_x_stop:Cfg.submission_x_step]
     out_path = args.out
     with open(out_path, "w") as f:
