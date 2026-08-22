@@ -24,7 +24,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
-from config import Cfg, select_families
+from config import Cfg, load_velocity_stats, select_families, stats_path_for_families
 
 if Cfg.device == "auto":
     Cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -325,8 +325,25 @@ def main():
         default=None,
         help="Case-insensitive family keyword(s), comma-separated, or 'all'.",
     )
+    parser.add_argument(
+        "--stats_path",
+        default=None,
+        help="Optional velocity-statistics JSON path; defaults to the selected families.",
+    )
     args = parser.parse_args()
     selected_families = select_families(args.family)
+    stats_path = Path(args.stats_path) if args.stats_path else stats_path_for_families(
+        selected_families
+    )
+    if stats_path.is_file():
+        vel_mean, vel_std = load_velocity_stats(stats_path)
+        print(f"[info] loaded velocity statistics: {stats_path}")
+    else:
+        vel_mean, vel_std = Cfg.vel_mean, Cfg.vel_std
+        print(
+            f"[warn] statistics file not found: {stats_path}; "
+            "using Cfg.vel_mean and Cfg.vel_std"
+        )
     if args.family and args.out_dir == str(Cfg.output_dir):
         output_name = args.family.strip().lower().replace(",", "_")
         args.out_dir = os.path.join(args.out_dir, output_name)
@@ -355,8 +372,8 @@ def main():
     va_idx = [idx for idx in indices if idx[0] in va_set]
     print(f"[info] train samples: {len(tr_idx)}, val samples: {len(va_idx)}")
 
-    train_ds = SeisVelDataset(pairs, tr_idx)
-    val_ds   = SeisVelDataset(pairs, va_idx)
+    train_ds = SeisVelDataset(pairs, tr_idx, vel_mean=vel_mean, vel_std=vel_std)
+    val_ds   = SeisVelDataset(pairs, va_idx, vel_mean=vel_mean, vel_std=vel_std)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=Cfg.num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
@@ -378,8 +395,8 @@ def main():
         tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, Cfg.device)
         va_loss = validate(model, val_loader, criterion, Cfg.device)
         scheduler.step()
-        train_mae_raw = tr_loss * Cfg.vel_std
-        val_mae_raw = va_loss * Cfg.vel_std
+        train_mae_raw = tr_loss * vel_std
+        val_mae_raw = va_loss * vel_std
         history.append({
             "epoch": epoch,
             "train_mae_norm": tr_loss,
@@ -409,6 +426,17 @@ def main():
             key: value for key, value in vars(Cfg).items()
             if not key.startswith("__") and not callable(value)
         },
+        "velocity_statistics": {
+            "path": stats_path,
+            "mean": vel_mean,
+            "std": vel_std,
+        },
+    })
+    save_json(run_dir / "velocity_stats.json", {
+        "families": selected_families,
+        "mean": vel_mean,
+        "std": vel_std,
+        "source": stats_path,
     })
     save_json(run_dir / "results.json", {
         "run_dir": run_dir,
@@ -423,10 +451,13 @@ def main():
         "epochs_completed": len(history),
         "best_epoch": best_epoch,
         "best_val_mae_norm": best_val,
-        "best_val_mae_raw": best_val * Cfg.vel_std,
+        "best_val_mae_raw": best_val * vel_std,
+        "velocity_mean": vel_mean,
+        "velocity_std": vel_std,
+        "velocity_stats_path": stats_path,
         "elapsed_seconds": elapsed_seconds,
     })
-    print(f"[done] best val_mae_raw = {best_val * Cfg.vel_std:.2f}")
+    print(f"[done] best val_mae_raw = {best_val * vel_std:.2f}")
     print(f"[done] run artifacts saved to {run_dir}")
 
 

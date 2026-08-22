@@ -73,6 +73,30 @@ def select_families(query=None):
     return selected
 
 
+def family_slug(families):
+    """Create a stable filesystem-safe name for a family selection."""
+    return "_".join(family.lower() for family in families)
+
+
+def stats_path_for_families(families, output_root=None):
+    """Return the shared JSON path used for a family selection's statistics."""
+    root = Cfg.output_dir if output_root is None else Path(output_root)
+    return root / "stats" / f"velocity_stats_{family_slug(families)}.json"
+
+
+def load_velocity_stats(path):
+    """Load and validate mean/std values from a computed statistics JSON file."""
+    import json
+
+    with open(path) as file:
+        stats = json.load(file)
+    mean = float(stats["mean"])
+    std = float(stats["std"])
+    if std <= 0:
+        raise ValueError(f"Velocity standard deviation must be positive: {path}")
+    return mean, std
+
+
 class Cfg:
     """Shared paths, dataset settings, model hyperparameters, and test options."""
 
@@ -82,6 +106,7 @@ class Cfg:
     train_data_dir = input_root / "train_samples"
     test_data_dir = input_root / "test"
     output_dir = resolve_output_root(project_root)
+    stats_dir = output_dir / "stats"
     checkpoint_path = output_dir / "best_unet.pth"
     history_path = output_dir / "history.json"
     submission_path = output_dir / "submission.csv"

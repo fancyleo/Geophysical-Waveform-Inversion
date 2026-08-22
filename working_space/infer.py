@@ -16,6 +16,7 @@ Output format (matching sample_submission.csv):
 import os
 import glob
 import argparse
+from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -24,6 +25,7 @@ from tqdm.auto import tqdm
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from working_space.train import UNet, Cfg   # Reuse the model and shared configuration.
+from working_space.config import load_velocity_stats
 
 # ---------------------------------------------------------------------------
 # Test dataset
@@ -64,8 +66,22 @@ def main():
     parser.add_argument("--batch_size", type=int, default=Cfg.infer_batch_size)
     parser.add_argument("--vel_mean", type=float, default=Cfg.vel_mean)
     parser.add_argument("--vel_std",  type=float, default=Cfg.vel_std)
+    parser.add_argument(
+        "--stats_path",
+        default=None,
+        help="Optional velocity-statistics JSON path; defaults to the checkpoint directory.",
+    )
     args = parser.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+
+    stats_path = (
+        Path(args.stats_path)
+        if args.stats_path
+        else Path(args.ckpt).resolve().parent / "velocity_stats.json"
+    )
+    if stats_path.is_file():
+        args.vel_mean, args.vel_std = load_velocity_stats(stats_path)
+        print(f"[info] loaded velocity statistics: {stats_path}")
 
     device_name = Cfg.device
     if device_name == "auto":

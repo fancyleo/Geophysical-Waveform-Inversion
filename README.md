@@ -80,8 +80,9 @@ python working_space/train.py
 python working_space/infer.py
 ```
 
-The statistics command reports the velocity mean and standard deviation. Set
-`Cfg.vel_mean` and `Cfg.vel_std` in `working_space/config.py` before training.
+The statistics command reports and saves the velocity mean and standard
+deviation. Training automatically loads the JSON statistics file for the
+selected family, so `Cfg.vel_mean` and `Cfg.vel_std` are only fallback values.
 
 To override selected settings:
 

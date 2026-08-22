@@ -8,10 +8,10 @@ Usage:
     python compute_stats.py --data_dir /kaggle/input/waveform-inversion/train_samples
 """
 
-import os, glob, argparse
+import os, glob, argparse, json
 import numpy as np
 from tqdm.auto import tqdm
-from config import Cfg, select_families
+from config import Cfg, select_families, stats_path_for_families
 
 def main():
     """Compute summary statistics for all velocity files under the data root."""
@@ -21,6 +21,11 @@ def main():
         "--family",
         default=None,
         help="Case-insensitive family keyword(s), comma-separated, or 'all'.",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="Optional JSON output path for the computed statistics.",
     )
     args = parser.parse_args()
     selected_families = select_families(args.family)
@@ -40,6 +45,9 @@ def main():
     print(f"[info] selected families: {', '.join(selected_families)}")
     print(f"[info] found {len(files)} velocity .npy files")
 
+    if not files:
+        raise RuntimeError("No velocity files found for the selected families")
+
     vals = []
     for fp in tqdm(files, desc="velocity statistics"):
         arr = np.load(fp)                # Shape: (500, 70, 70) or (500, 1, 70, 70).
@@ -52,7 +60,25 @@ def main():
     print(f"[stats] min     = {vals.min():.2f}")
     print(f"[stats] max     = {vals.max():.2f}")
     print(f"[stats] median  = {np.median(vals):.2f}")
-    print("\nCopy the reported mean and std to Cfg.vel_mean and Cfg.vel_std in config.py.")
+    stats_path = (
+        os.path.abspath(args.out)
+        if args.out
+        else str(stats_path_for_families(selected_families))
+    )
+    stats = {
+        "families": selected_families,
+        "data_dir": os.path.abspath(args.data_dir),
+        "count": int(vals.size),
+        "mean": float(vals.mean()),
+        "std": float(vals.std()),
+        "min": float(vals.min()),
+        "max": float(vals.max()),
+        "median": float(np.median(vals)),
+    }
+    os.makedirs(os.path.dirname(stats_path) or ".", exist_ok=True)
+    with open(stats_path, "w") as file:
+        json.dump(stats, file, indent=2)
+    print(f"[done] saved velocity statistics to {stats_path}")
 
 if __name__ == "__main__":
     main()
