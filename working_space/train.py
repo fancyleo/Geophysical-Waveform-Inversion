@@ -14,7 +14,7 @@ Expected data layout (Kaggle input or local):
 Submission format: one row per oid/y position with odd x-columns only.
 """
 
-import os, glob, json, argparse, time
+import os, glob, json, argparse, time, gc
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -308,12 +308,19 @@ def validate(model, loader, criterion, device):
 
 
 def log_memory_state(epoch, args):
-    """Print host and CUDA memory usage for one epoch."""
+    """Print host, system, and CUDA memory usage for one epoch."""
     if not args.log_memory:
         return
     rss_mb = current_rss_mb()
     if rss_mb is not None:
         print(f"[mem] epoch {epoch:03d}  host_rss={rss_mb:.0f} MiB")
+    if psutil is not None:
+        virtual = psutil.virtual_memory()
+        print(
+            f"[mem] epoch {epoch:03d}  "
+            f"sys_available={virtual.available/1024**2:.0f} MiB  "
+            f"sys_used={virtual.used/1024**2:.0f} MiB"
+        )
     if Cfg.device.startswith("cuda"):
         print(
             f"[mem] epoch {epoch:03d}  "
@@ -443,6 +450,8 @@ def main():
     tr_set = set(tr_files); va_set = set(va_files)
     tr_idx = [idx for idx in indices if idx[0] in tr_set]
     va_idx = [idx for idx in indices if idx[0] in va_set]
+    del indices, tr_set, va_set
+    gc.collect()
     print(f"[info] train samples: {len(tr_idx)}, val samples: {len(va_idx)}")
 
     train_ds = SeisVelDataset(pairs, tr_idx, vel_mean=vel_mean, vel_std=vel_std)
@@ -472,6 +481,7 @@ def main():
         va_loss = validate(model, val_loader, criterion, Cfg.device)
         scheduler.step()
         log_memory_state(epoch, args)
+        gc.collect()
         train_mae_raw = tr_loss * vel_std
         val_mae_raw = va_loss * vel_std
         history.append({
