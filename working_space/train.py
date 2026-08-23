@@ -377,6 +377,12 @@ def main():
     parser.add_argument("--epochs",   type=int, default=Cfg.epochs)
     parser.add_argument("--batch_size", type=int, default=Cfg.batch_size)
     parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=Cfg.num_workers,
+        help="DataLoader worker count; use 0 to eliminate worker memory overhead.",
+    )
+    parser.add_argument(
         "--parallel_mode",
         choices=("single", "data_parallel", "ddp"),
         default=Cfg.parallel_mode,
@@ -442,9 +448,9 @@ def main():
     train_ds = SeisVelDataset(pairs, tr_idx, vel_mean=vel_mean, vel_std=vel_std)
     val_ds   = SeisVelDataset(pairs, va_idx, vel_mean=vel_mean, vel_std=vel_std)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=Cfg.num_workers, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=Cfg.num_workers, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=True)
 
     # Build the model, optimizer, scheduler, and loss function.
     model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(Cfg.device)
