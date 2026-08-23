@@ -118,14 +118,18 @@ class SeisVelDataset(Dataset):
         fi, si = self.idx_list[i]
         seis_arr, vel_arr = self._open(fi)
 
-        seis = seis_arr[si].astype(np.float32)   # Shape: (5, 1000, 70).
-        vel  = vel_arr[si].astype(np.float32)    # Shape: (70, 70) or (1, 70, 70).
+        # Indexing a memmap yields a read-only view; copy it into a writable
+        # float32 buffer so in-place ops below are valid.
+        seis = np.array(seis_arr[si], dtype=np.float32, copy=True)   # (5, 1000, 70).
+        vel  = np.array(vel_arr[si], dtype=np.float32, copy=True)    # (70, 70) or (1, 70, 70).
 
         # Normalize the velocity target.
-        vel = (vel - self.vel_mean) / self.vel_std
+        vel -= self.vel_mean
+        vel /= self.vel_std
 
-        # Compress the seismic dynamic range.
-        seis = np.log1p(np.abs(seis))
+        # Compress the seismic dynamic range with in-place ops to limit temporaries.
+        np.abs(seis, out=seis)
+        np.log1p(seis, out=seis)
 
         # Treat the five sources as channels in a 2D convolutional input.
         seis = seis.reshape(Cfg.n_src, Cfg.n_steps, Cfg.n_recv)
@@ -456,10 +460,13 @@ def main():
 
     train_ds = SeisVelDataset(pairs, tr_idx, vel_mean=vel_mean, vel_std=vel_std)
     val_ds   = SeisVelDataset(pairs, va_idx, vel_mean=vel_mean, vel_std=vel_std)
+    # Pinning only helps when workers copy batches; with num_workers=0 it is
+    # pure host-memory overhead and a common source of pinned-pool growth.
+    use_pin_memory = args.num_workers > 0
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=use_pin_memory)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=use_pin_memory)
 
     # Build the model, optimizer, scheduler, and loss function.
     model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(Cfg.device)
