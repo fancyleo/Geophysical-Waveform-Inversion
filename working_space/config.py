@@ -133,9 +133,10 @@ class Cfg:
     val_ratio = 0.1
     model_base_channels = 32
 
-    # Target normalization; replace these values with compute_stats.py output.
-    vel_mean = 3500.0
-    vel_std = 500.0
+    # Target normalization; values computed for all 10 families via compute_stats.py.
+    # train.py prefers the stats JSON in output/stats/ when it exists.
+    vel_mean = 2916.82
+    vel_std = 817.36
 
     # Training data families
     families = [
