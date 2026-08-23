@@ -26,6 +26,19 @@ from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 from config import Cfg, load_velocity_stats, select_families, stats_path_for_families
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+
+def current_rss_mb():
+    """Return current resident memory in MiB when psutil is available."""
+    if psutil is None:
+        return None
+    return psutil.Process().memory_info().rss / 1024**2
+
+
 if Cfg.device == "auto":
     Cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -294,6 +307,21 @@ def validate(model, loader, criterion, device):
     return total / max(n, 1)
 
 
+def log_memory_state(epoch, args):
+    """Print host and CUDA memory usage for one epoch."""
+    if not args.log_memory:
+        return
+    rss_mb = current_rss_mb()
+    if rss_mb is not None:
+        print(f"[mem] epoch {epoch:03d}  host_rss={rss_mb:.0f} MiB")
+    if Cfg.device.startswith("cuda"):
+        print(
+            f"[mem] epoch {epoch:03d}  "
+            f"cuda_allocated={torch.cuda.memory_allocated()/1024**2:.0f} MiB  "
+            f"cuda_reserved={torch.cuda.memory_reserved()/1024**2:.0f} MiB"
+        )
+
+
 def create_run_dir(output_root):
     """Create a timestamped directory for one training run's artifacts."""
     timestamp = datetime.now().strftime("%y%m%d_%H%M")
@@ -364,6 +392,11 @@ def main():
         default=None,
         help="Optional velocity-statistics JSON path; defaults to the selected families.",
     )
+    parser.add_argument(
+        "--log_memory",
+        action="store_true",
+        help="Print host and CUDA memory usage after each epoch.",
+    )
     args = parser.parse_args()
     selected_families = select_families(args.family)
     stats_path = Path(args.stats_path) if args.stats_path else stats_path_for_families(
@@ -432,6 +465,7 @@ def main():
         tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, Cfg.device)
         va_loss = validate(model, val_loader, criterion, Cfg.device)
         scheduler.step()
+        log_memory_state(epoch, args)
         train_mae_raw = tr_loss * vel_std
         val_mae_raw = va_loss * vel_std
         history.append({
