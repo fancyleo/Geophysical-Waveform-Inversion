@@ -115,7 +115,9 @@ class Cfg:
     # Reproducibility and runtime
     seed = 42
     device = "auto"                 # auto, cpu, or cuda
-    parallel_mode = "data_parallel" # single, data_parallel, or ddp
+    # single is stable and leak-free on host memory; data_parallel uses all
+    # GPUs but can grow host RSS on multi-GPU T4 via scatter/gather buffers.
+    parallel_mode = "single"        # single, data_parallel, or ddp
     num_workers = 2
 
     # Dataset dimensions

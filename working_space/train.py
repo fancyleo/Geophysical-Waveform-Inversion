@@ -290,6 +290,9 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         total += loss.item() * bs
         n += bs
         progress.set_postfix(loss=f"{loss.item():.4f}")
+        # Release intermediate tensors so DataParallel gather buffers do not
+        # accumulate in host memory across the epoch.
+        del seis, vel, pred, loss
     return total / max(n, 1)
 
 
@@ -308,6 +311,7 @@ def validate(model, loader, criterion, device):
         total += loss.item() * bs
         n += bs
         progress.set_postfix(loss=f"{loss.item():.4f}")
+        del seis, vel, pred, loss
     return total / max(n, 1)
 
 
@@ -507,7 +511,10 @@ def main():
         if va_loss < best_val:
             best_val = va_loss
             best_epoch = epoch
-            torch.save(unwrap_model(model).state_dict(), run_dir / "best_unet.pth")
+            state = unwrap_model(model).state_dict()
+            torch.save(state, run_dir / "best_unet.pth")
+            del state
+            gc.collect()
             print(f"  saved best (val_mae_raw={val_mae_raw:.2f})")
 
     elapsed_seconds = time.perf_counter() - run_started_at
