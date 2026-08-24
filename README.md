@@ -183,11 +183,24 @@ The output directory can be changed with `--out_dir` or
 The training entry point accepts `single`, `data_parallel`, and `ddp`:
 
 - `single` (default): one device; stable on host memory.
-- `data_parallel`: uses `nn.DataParallel` across available CUDA GPUs. When only
-  one GPU is available it degrades to `single`. Checkpoints are saved without
-  the `module.` prefix, so they load fine with a single-GPU model.
-- `ddp`: reserved as a future distributed-training backend; it currently
-  reports an explicit error instead of running a different configuration.
+- `data_parallel` / `ddp`: run through PyTorch `DistributedDataParallel` when
+  `--nproc_per_node` is greater than one; otherwise they degrade to `single`.
+  `data_parallel` is kept as an alias for `ddp` for CLI compatibility.
+
+To launch a multi-GPU DDP run:
+
+```powershell
+python working_space/train.py \
+    --family all \
+    --parallel_mode data_parallel \
+    --nproc_per_node 2
+```
+
+DDP spawns one process per GPU. Only the main process (rank 0) writes run
+artifacts; the others participate in training and exit. This avoids the host
+memory growth seen with `nn.DataParallel`, since gradient synchronization goes
+through NCCL instead of host-side scatter/gather. `single` mode is never
+changed and remains the safe default for local runs.
 
 ## Kaggle Usage
 
