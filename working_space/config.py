@@ -24,15 +24,17 @@ def resolve_data_root():
 
     candidates.append(project_root / "input" / "waveform-inversion")
 
-    kaggle_input = Path("/kaggle/input")
-    if kaggle_input.is_dir():
-        candidates.extend(path for path in kaggle_input.iterdir() if path.is_dir())
-
-    kaggle_competition = Path("/kaggle/competition")
-    if kaggle_competition.is_dir():
-        candidates.extend(
-            path for path in kaggle_competition.iterdir() if path.is_dir()
-        )
+    # Kaggle mounts the dataset under a nested layout, e.g.
+    #   /kaggle/input/waveform-inversion
+    #   /kaggle/input/competitions/waveform-inversion
+    #   /kaggle/competition/waveform-inversion
+    for base in (Path("/kaggle/input"), Path("/kaggle/competition")):
+        if not base.is_dir():
+            continue
+        candidates.extend(path for path in base.iterdir() if path.is_dir())
+        competitions = base / "competitions"
+        if competitions.is_dir():
+            candidates.extend(path for path in competitions.iterdir() if path.is_dir())
 
     for candidate in candidates:
         if _is_waveform_root(candidate):
