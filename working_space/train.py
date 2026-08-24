@@ -30,7 +30,7 @@ from config import Cfg, load_velocity_stats, resolve_device, select_families, st
 from data import SeisVelDataset, build_flat_indices, find_pairs
 from model import UNet
 from training import train_one_epoch, unwrap_model, validate, wrap_model_for_parallel
-from utils import create_run_dir, log_memory_state, save_json, save_mae_curve
+from utils import create_run_dir, current_rss_mb, log_memory_state, save_json, save_mae_curve
 
 # ---------------------------------------------------------------------------
 # Command-line entry point
@@ -69,7 +69,22 @@ def main():
         action="store_true",
         help="Print host and CUDA memory usage after each epoch.",
     )
+    parser.add_argument(
+        "--test_run",
+        action="store_true",
+        help="Run a 3-epoch smoke training on the flat families with memory monitoring.",
+    )
     args = parser.parse_args()
+
+    if args.test_run:
+        # test_run only overrides family, epochs, and memory logging; all other
+        # settings (batch_size, num_workers, parallel_mode, ...) follow the
+        # user-supplied values or Cfg defaults.
+        args.family = "flat"
+        args.epochs = 3
+        args.log_memory = True
+        print("[info] test_run enabled: flat families, 3 epochs, memory monitoring on")
+
     device = resolve_device()
     selected_families = select_families(args.family)
     stats_path = Path(args.stats_path) if args.stats_path else stats_path_for_families(
@@ -87,7 +102,8 @@ def main():
     if args.family and args.out_dir == str(Cfg.output_dir):
         output_name = args.family.strip().lower().replace(",", "_")
         args.out_dir = os.path.join(args.out_dir, output_name)
-    run_dir = create_run_dir(args.out_dir)
+    run_prefix = "test" if args.test_run else "model"
+    run_dir = create_run_dir(args.out_dir, prefix=run_prefix)
     run_started_at = time.perf_counter()
 
     torch.manual_seed(Cfg.seed)
@@ -139,11 +155,20 @@ def main():
     best_val = float("inf")
     best_epoch = None
     history = []
+    memory_series = []
+    rss_baseline = current_rss_mb()
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
         va_loss = validate(model, val_loader, criterion, device)
         scheduler.step()
-        log_memory_state(epoch, args)
+        log_memory_state(epoch, args, rss_baseline)
+        if args.log_memory:
+            memory_series.append({
+                "epoch": epoch,
+                "host_rss": current_rss_mb(),
+                "cuda_allocated": torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else None,
+                "cuda_reserved": torch.cuda.memory_reserved() / 1024**2 if torch.cuda.is_available() else None,
+            })
         gc.collect()
         train_mae_raw = tr_loss * vel_std
         val_mae_raw = va_loss * vel_std
@@ -212,6 +237,7 @@ def main():
         "velocity_std": vel_std,
         "velocity_stats_path": stats_path,
         "elapsed_seconds": elapsed_seconds,
+        "memory_monitoring": memory_series,
     })
     print(f"[done] best val_mae_raw = {best_val * vel_std:.2f}")
     print(f"[done] run artifacts saved to {run_dir}")

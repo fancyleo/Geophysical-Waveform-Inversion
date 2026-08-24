@@ -142,6 +142,23 @@ python working_space/train.py \
 - `--log_memory` prints host and CUDA memory after each epoch so leaks can be
   detected early.
 
+### Quick smoke run
+
+```powershell
+python working_space/train.py --test_run
+```
+
+`--test_run` overrides only three settings for a fast validation run: it
+selects the flat families (`FlatVel_*`, `FlatFault_*`), trains 3 epochs, and
+turns memory monitoring on. All other arguments (e.g. `--batch_size`,
+`--num_workers`, `--parallel_mode`) follow the user-supplied values or `Cfg`
+defaults. Run artifacts are written to a `test_YYMMDD_HHMM` directory instead
+of `model_YYMMDD_HHMM`. Per-epoch host RSS and CUDA usage are printed, and the
+per-epoch memory series is stored in `results.json` under `memory_monitoring`.
+A stable `host_rss` delta across epochs indicates no host memory leak. Formal
+training keeps memory monitoring off by default (`--log_memory` is only enabled
+when requested).
+
 ## Training Run Artifacts
 
 Each training command creates a timestamped run directory. The name is
