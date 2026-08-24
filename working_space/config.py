@@ -145,6 +145,20 @@ class Cfg:
     val_ratio = 0.1
     model_base_channels = 32
 
+    # Data augmentation (train only; applied to raw physical traces before
+    # abs/log1p and velocity normalization). Each key maps to params passed to
+    # the matching function in data_aug.py; "prob" is the apply probability.
+    # Set prob to 0 or remove a key to disable that augmentation. To add a new
+    # one, write it in data_aug.py with @register_aug("name") and enable here.
+    augmentations = {
+        "xflip": {"prob": 0.5},
+        "time_shift": {"prob": 0.5, "max_shift": 100},
+        # "noise": {"prob": 0.5, "sigma": 0.01},
+        # "receiver_dropout": {"prob": 0.3, "drop_ratio": 0.15},
+        # "amplitude_scale": {"prob": 0.5, "low": 0.85, "high": 1.15},
+        # "source_dropout": {"prob": 0.3},
+    }
+
     # Target normalization; values computed for all 10 families via compute_stats.py.
     # train.py prefers the stats JSON in output/stats/ when it exists.
     vel_mean = 2916.82

@@ -15,6 +15,7 @@ Kaggle competition. The model maps five-source seismic measurements to a
 ├── working_space/
 │   ├── config.py       # Shared paths, hyperparameters, and path resolution
 │   ├── data.py         # File pairing, lazy dataset, and sample indices
+│   ├── data_aug.py     # Data augmentation transforms (registry pattern)
 │   ├── model.py        # U-Net architecture
 │   ├── training.py     # Train/validate loops and parallelization helpers
 │   ├── utils.py        # Memory logging and artifact persistence
@@ -73,6 +74,62 @@ The data root is resolved in this order:
 `/kaggle/working` is used when available, and local runs use `output`.
 Command-line arguments override the relevant defaults, which makes the same
 scripts usable with Kaggle paths.
+
+## Data Augmentation
+
+Augmentation lives in its own module,
+[working_space/data_aug.py](working_space/data_aug.py), using a registry
+pattern so new transforms can be added without touching the dispatch logic.
+
+Each augmentation is a pure function with the signature:
+
+```python
+fn(seismic, velocity, rng, **params) -> (seismic, velocity)
+```
+
+applied to the *raw* physical traces — before `abs`/`log1p` and before the
+velocity normalization — so physics-based transforms (time shift, amplitude
+scaling, noise) remain valid. Augmentation runs on the training set only; the
+validation set is never augmented.
+
+The active set is controlled by `Cfg.augmentations` in `config.py`:
+
+```python
+augmentations = {
+    "xflip": {"prob": 0.5},
+    "time_shift": {"prob": 0.5, "max_shift": 100},
+    # "noise": {"prob": 0.5, "sigma": 0.01},
+    # "receiver_dropout": {"prob": 0.3, "drop_ratio": 0.15},
+    # "amplitude_scale": {"prob": 0.5, "low": 0.85, "high": 1.15},
+    # "source_dropout": {"prob": 0.3},
+}
+```
+
+Each key maps to the parameters passed to the matching registered function;
+`prob` is the per-sample application probability. Set `prob` to `0` or remove
+a key to disable that augmentation.
+
+Registered transforms:
+
+- `xflip` — mirror the receiver axis and the velocity model horizontally.
+- `time_shift` — shift the time axis with zero padding (source excitation
+  delay); uses pad + slice instead of `roll` to avoid non-physical wrap-around.
+- `noise` — additive Gaussian observation noise (`sigma` is relative to the
+  trace's own standard deviation).
+- `receiver_dropout` — zero random receiver traces (dead-channel simulation).
+- `amplitude_scale` — scale trace amplitudes (source-strength variation).
+- `source_dropout` — zero one random source channel (multi-source redundancy).
+
+To add a new augmentation:
+
+1. Write a function in `data_aug.py` with the signature above.
+2. Decorate it with `@register_aug("name")`.
+3. Enable it under `Cfg.augmentations` in `config.py`.
+
+> **Note on `xflip`**: it currently flips `velocity[:, ::-1]`, assuming the
+> second dimension of the velocity model runs along the receiver (horizontal)
+> axis. If a visualization shows the horizontal axis is the first dimension,
+> change that line to `velocity[::-1, :]`.
 
 ## Local Usage
 

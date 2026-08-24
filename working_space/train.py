@@ -171,8 +171,12 @@ def train_worker(local_rank, world_size, args):
     if is_main_process():
         print(f"[info] train samples: {len(tr_idx)}, val samples: {len(va_idx)}")
 
-    train_ds = SeisVelDataset(pairs, tr_idx, vel_mean=vel_mean, vel_std=vel_std)
-    val_ds   = SeisVelDataset(pairs, va_idx, vel_mean=vel_mean, vel_std=vel_std)
+    train_ds = SeisVelDataset(
+        pairs, tr_idx, vel_mean=vel_mean, vel_std=vel_std,
+        augmentations=Cfg.augmentations, train=True, seed=Cfg.seed,
+    )
+    val_ds = SeisVelDataset(pairs, va_idx, vel_mean=vel_mean, vel_std=vel_std,
+                            train=False)
     # Pinning only helps when workers copy batches; with num_workers=0 it is
     # pure host-memory overhead and a common source of pinned-pool growth.
     use_pin_memory = args.num_workers > 0

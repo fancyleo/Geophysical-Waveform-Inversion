@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from config import Cfg
+from data_aug import apply_augmentation
 
 
 def find_fault_pairs(family_dir):
@@ -103,11 +104,15 @@ def build_flat_indices(pairs):
 class SeisVelDataset(Dataset):
     """Lazily load individual seismic and velocity samples from NumPy files."""
 
-    def __init__(self, pairs, idx_list, vel_mean=Cfg.vel_mean, vel_std=Cfg.vel_std):
+    def __init__(self, pairs, idx_list, vel_mean=Cfg.vel_mean, vel_std=Cfg.vel_std,
+                 augmentations=None, train=True, seed=0):
         self.pairs = pairs
         self.idx_list = idx_list
         self.vel_mean = vel_mean
         self.vel_std = vel_std
+        self.augmentations = augmentations if train else None
+        self.train = train
+        self.seed = seed
         # Cache opened memory-mapped arrays within each worker process.
         self._seis_cache = {}
         self._vel_cache = {}
@@ -132,6 +137,19 @@ class SeisVelDataset(Dataset):
         # so the in-place normalization below is valid.
         seismic = np.array(seismic_arr[sample_index], dtype=np.float32, copy=True)
         velocity = np.array(velocity_arr[sample_index], dtype=np.float32, copy=True)
+
+        # Apply augmentation on the raw physical traces (before abs/log1p and
+        # before velocity normalization). A per-sample RNG derived from the
+        # dataset seed keeps results reproducible while varying across samples.
+        if self.augmentations:
+            rng = np.random.default_rng(self.seed + index)
+            seismic, velocity = apply_augmentation(
+                seismic, velocity, self.augmentations, rng, enabled=True
+            )
+            # Flipping introduces negative strides, which torch.from_numpy
+            # rejects; restore C-contiguous buffers before conversion.
+            seismic = np.ascontiguousarray(seismic)
+            velocity = np.ascontiguousarray(velocity)
 
         velocity -= self.vel_mean
         velocity /= self.vel_std
