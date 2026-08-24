@@ -102,6 +102,11 @@ def main():
         print("[info] test_run enabled: flat families, 3 epochs, memory monitoring on")
 
     if args.nproc_per_node > 1 and args.parallel_mode in ("data_parallel", "ddp"):
+        # mp.spawn + env:// rendezvous requires MASTER_ADDR/MASTER_PORT; they are
+        # not set by mp.spawn automatically. Default to the local node so the
+        # spawned processes can form the NCCL process group.
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
         mp.spawn(
             train_worker,
             args=(args.nproc_per_node, args),
