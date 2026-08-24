@@ -24,31 +24,70 @@ def find_fault_pairs(family_dir):
     return pairs
 
 
+def _pair_in_dirs(seis_dir, vel_dir):
+    """Pair seismic files in ``seis_dir`` with matching velocity files.
+
+    Tries ``dataN.npy -> modelN.npy`` first, then ``seisN.npy -> velN.npy``.
+    """
+    pairs = []
+    seismic_files = sorted(glob.glob(os.path.join(seis_dir, "*.npy")))
+    for seismic_path in seismic_files:
+        base = os.path.basename(seismic_path)
+        candidates = [
+            os.path.join(vel_dir, base.replace("data", "model")),
+            os.path.join(vel_dir, "vel" + base[4:]) if base.lower().startswith("seis") else None,
+        ]
+        for velocity_path in candidates:
+            if velocity_path and os.path.isfile(velocity_path):
+                pairs.append((seismic_path, velocity_path))
+                break
+    return pairs
+
+
+def _family_dirs(root, families):
+    """Return existing family directories matching the requested names.
+
+    Matches are case-insensitive so Linux/Kaggle layouts that differ in case
+    from ``Cfg.families`` still resolve correctly.
+    """
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return []
+
+    wanted = {family.lower() for family in families}
+    dirs = [entry for entry in entries
+            if os.path.isdir(os.path.join(root, entry)) and entry.lower() in wanted]
+    # If none of the configured names matched, fall back to every subdirectory.
+    if not dirs and families:
+        dirs = [entry for entry in entries if os.path.isdir(os.path.join(root, entry))]
+    return dirs
+
+
 def find_pairs(root, families=None):
     """Find paired seismic and velocity files for the selected families."""
     families = Cfg.families if families is None else families
     pairs = []
-    for family in families:
+    for family in _family_dirs(root, families):
         family_dir = os.path.join(root, family)
-        if not os.path.isdir(family_dir):
-            print(f"[warn] missing family dir: {family_dir}")
-            continue
-
-        # Velocity and style families store data and models in separate folders.
-        data_dir = os.path.join(family_dir, "data")
-        model_dir = os.path.join(family_dir, "model")
-        if os.path.isdir(data_dir) and os.path.isdir(model_dir):
-            for seismic_path in sorted(glob.glob(os.path.join(data_dir, "*.npy"))):
-                base = os.path.basename(seismic_path)
-                model_path = os.path.join(model_dir, base.replace("data", "model"))
-                if os.path.exists(model_path):
-                    pairs.append((seismic_path, model_path))
-            continue
-
-        # Fault families keep matching seis/vel files in the same directory tree.
-        pairs.extend(find_fault_pairs(family_dir))
-
+        pairs.extend(_find_pairs_in_family(family_dir))
     print(f"[info] total paired files: {len(pairs)}")
+    return pairs
+
+
+def _find_pairs_in_family(family_dir):
+    """Find all seismic/velocity pairs inside one family directory."""
+    pairs = []
+
+    # Layout A: data/ and model/ subdirectories.
+    data_dir = os.path.join(family_dir, "data")
+    model_dir = os.path.join(family_dir, "model")
+    if os.path.isdir(data_dir) and os.path.isdir(model_dir):
+        pairs.extend(_pair_in_dirs(data_dir, model_dir))
+        return pairs
+
+    # Layout B: fault-style seis/vel files at the same level.
+    pairs.extend(find_fault_pairs(family_dir))
     return pairs
 
 
