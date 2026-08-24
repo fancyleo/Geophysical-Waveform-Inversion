@@ -97,6 +97,16 @@ def load_velocity_stats(path):
     return mean, std
 
 
+def resolve_device(device=None):
+    """Return a ``torch.device`` from 'auto', 'cpu', or 'cuda'."""
+    import torch
+
+    device = Cfg.device if device is None else device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    return torch.device(device)
+
+
 class Cfg:
     """Shared paths, dataset settings, model hyperparameters, and test options."""
 

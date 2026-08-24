@@ -14,372 +14,23 @@ Expected data layout (Kaggle input or local):
 Submission format: one row per oid/y position with odd x-columns only.
 """
 
-import os, glob, json, argparse, time, gc
-from datetime import datetime
+import argparse
+import gc
+import os
+import time
 from pathlib import Path
+
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
-from tqdm.auto import tqdm
-from config import Cfg, load_velocity_stats, select_families, stats_path_for_families
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
-
-
-def current_rss_mb():
-    """Return current resident memory in MiB when psutil is available."""
-    if psutil is None:
-        return None
-    return psutil.Process().memory_info().rss / 1024**2
-
-
-if Cfg.device == "auto":
-    Cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ---------------------------------------------------------------------------
-# Data loading utilities
-# ---------------------------------------------------------------------------
-def find_pairs(root, families=None):
-    """Find paired seismic and velocity files for the selected families."""
-    families = Cfg.families if families is None else families
-    pairs = []
-    for fam in families:
-        fam_dir = os.path.join(root, fam)
-        if not os.path.isdir(fam_dir):
-            print(f"[warn] missing family dir: {fam_dir}")
-            continue
-
-        # Velocity and style families store data and models in separate folders.
-        data_dir = os.path.join(fam_dir, "data")
-        model_dir = os.path.join(fam_dir, "model")
-        if os.path.isdir(data_dir) and os.path.isdir(model_dir):
-            seis_files = sorted(glob.glob(os.path.join(data_dir, "*.npy")))
-            for sf in seis_files:
-                base = os.path.basename(sf)
-                # Convert data1.npy to model1.npy.
-                mf = os.path.join(model_dir, base.replace("data", "model"))
-                if os.path.exists(mf):
-                    pairs.append((sf, mf))
-            continue
-
-        pairs.extend(find_fault_pairs(fam_dir))
-
-    print(f"[info] total paired files: {len(pairs)}")
-    return pairs
-
-
-def find_fault_pairs(family_dir):
-    """Find recursive same-directory pairs such as ``seis2.npy`` and ``vel2.npy``."""
-    pairs = []
-    pattern = os.path.join(family_dir, "**", "seis*.npy")
-    for seismic_path in sorted(glob.glob(pattern, recursive=True)):
-        filename = os.path.basename(seismic_path)
-        velocity_path = os.path.join(
-            os.path.dirname(seismic_path), "vel" + filename[4:]
-        )
-        if os.path.isfile(velocity_path):
-            pairs.append((seismic_path, velocity_path))
-    return pairs
-
-
-class SeisVelDataset(Dataset):
-    """Lazily load individual seismic and velocity samples from NumPy files."""
-
-    def __init__(self, pairs, idx_list, vel_mean=Cfg.vel_mean, vel_std=Cfg.vel_std):
-        """Initialize the dataset with file pairs and flattened sample indices."""
-        self.pairs = pairs
-        self.idx_list = idx_list
-        self.vel_mean = vel_mean
-        self.vel_std = vel_std
-        # Cache opened memory-mapped arrays within each worker process.
-        self._seis_cache = {}
-        self._vel_cache = {}
-
-    def __len__(self):
-        """Return the number of indexed samples."""
-        return len(self.idx_list)
-
-    def _open(self, fi):
-        """Open and cache the seismic and velocity arrays for one file pair."""
-        if fi not in self._seis_cache:
-            sp, vp = self.pairs[fi]
-            self._seis_cache[fi] = np.load(sp, mmap_mode="r")
-            self._vel_cache[fi] = np.load(vp, mmap_mode="r")
-        return self._seis_cache[fi], self._vel_cache[fi]
-
-    def __getitem__(self, i):
-        """Load, preprocess, and return one seismic/velocity sample pair."""
-        fi, si = self.idx_list[i]
-        seis_arr, vel_arr = self._open(fi)
-
-        # Indexing a memmap yields a read-only view; copy it into a writable
-        # float32 buffer so in-place ops below are valid.
-        seis = np.array(seis_arr[si], dtype=np.float32, copy=True)   # (5, 1000, 70).
-        vel  = np.array(vel_arr[si], dtype=np.float32, copy=True)    # (70, 70) or (1, 70, 70).
-
-        # Normalize the velocity target.
-        vel -= self.vel_mean
-        vel /= self.vel_std
-
-        # Compress the seismic dynamic range with in-place ops to limit temporaries.
-        np.abs(seis, out=seis)
-        np.log1p(seis, out=seis)
-
-        # Treat the five sources as channels in a 2D convolutional input.
-        seis = seis.reshape(Cfg.n_src, Cfg.n_steps, Cfg.n_recv)
-
-        return torch.from_numpy(seis), torch.from_numpy(vel)
-
-
-def build_flat_indices(pairs):
-    """Build flattened ``(file_index, sample_index)`` pairs for all files."""
-    indices = []
-    for fi, (sp, _) in enumerate(pairs):
-        arr = np.load(sp, mmap_mode="r")
-        n = arr.shape[0]
-        for si in range(n):
-            indices.append((fi, si))
-    return indices
-
-
-def resolve_parallel_mode(mode, device, gpu_count):
-    """Resolve the requested parallel mode against the available hardware."""
-    if mode not in {"single", "data_parallel", "ddp"}:
-        raise ValueError(f"Unsupported parallel mode: {mode}")
-    if mode == "ddp":
-        raise NotImplementedError(
-            "DDP is reserved for the distributed training entry point. "
-            "Use data_parallel for the current notebook workflow."
-        )
-    if mode == "data_parallel" and device.startswith("cuda") and gpu_count > 1:
-        return "data_parallel"
-    return "single"
-
-
-def wrap_model_for_parallel(model, mode, device):
-    """Wrap a model for the selected parallel backend."""
-    resolved_mode = resolve_parallel_mode(mode, device, torch.cuda.device_count())
-    if resolved_mode == "data_parallel":
-        print(f"[info] using DataParallel on {torch.cuda.device_count()} GPUs")
-        return nn.DataParallel(model), resolved_mode
-    return model, resolved_mode
-
-
-def unwrap_model(model):
-    """Return the underlying model from a parallel wrapper."""
-    return model.module if isinstance(model, nn.DataParallel) else model
-
-
-# ---------------------------------------------------------------------------
-# U-Net model: input (5, 1000, 70) -> output (1, 70, 70)
-# ---------------------------------------------------------------------------
-class DoubleConv(nn.Module):
-    """Apply two convolution, batch-normalization, and ReLU blocks."""
-
-    def __init__(self, in_ch, out_ch):
-        """Create a double-convolution block with the requested channel sizes."""
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-    def forward(self, x):
-        """Apply the convolutional block to an input tensor."""
-        return self.net(x)
-
-class UNet(nn.Module):
-    """Map five-source seismic measurements to a 70 x 70 velocity map."""
-
-    def __init__(self, in_ch=Cfg.n_src, base=Cfg.model_base_channels):
-        """Build the encoder, decoder, and output projection layers."""
-        super().__init__()
-        # Encoder: progressively reduce the time and receiver dimensions.
-        self.enc1 = DoubleConv(in_ch, base)        # 1000x70 -> 1000x70
-        self.pool1 = nn.MaxPool2d(2, 2)            # -> 500x35
-        self.enc2 = DoubleConv(base, base*2)       # 500x35
-        self.pool2 = nn.MaxPool2d(2, 2)            # -> 250x17 (pad to 250x18)
-        self.enc3 = DoubleConv(base*2, base*4)     # 250x18
-        self.pool3 = nn.MaxPool2d(2, 2)            # -> 125x9
-        self.enc4 = DoubleConv(base*4, base*8)     # 125x9
-        self.pool4 = nn.MaxPool2d(2, 2)             # -> 62x4 (pad to 62x5)
-        self.enc5 = DoubleConv(base*8, base*16)    # 62x5
-
-        # Project the bottleneck back to the first decoder resolution.
-        self.up = nn.Sequential(
-            nn.ConvTranspose2d(base*16, base*8, kernel_size=(9, 14),
-                                stride=(2, 2)),    # 62x5 -> 125x10 (approx)
-            nn.BatchNorm2d(base*8),
-            nn.ReLU(inplace=True),
-        )
-
-        # Decoder blocks with skip connections.
-        self.dec1 = DoubleConv(base*16, base*8)     # concat with enc4
-        self.up2 = nn.ConvTranspose2d(base*8, base*4, kernel_size=4, stride=2, padding=1)
-        self.dec2 = DoubleConv(base*8, base*4)
-        self.up3 = nn.ConvTranspose2d(base*4, base*2, kernel_size=4, stride=2, padding=1)
-        self.dec3 = DoubleConv(base*4, base*2)
-        self.up4 = nn.ConvTranspose2d(base*2, base,   kernel_size=(4, 4), stride=(2, 2), padding=(1, 1))
-        self.dec4 = DoubleConv(base*2, base)
-        self.dec5 = DoubleConv(base, base)
-
-        self.head = nn.Conv2d(base, 1, 1)
-
-    def forward(self, x):
-        """Run the U-Net and return a tensor with shape ``(B, 70, 70)``."""
-        # Input shape: (B, 5, 1000, 70).
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool1(e1))
-        # Pad the receiver dimension to make the next pooling operation even.
-        e2p = nn.functional.pad(e2, (0, 1))         # 17->18
-        e3 = self.enc3(self.pool2(e2p))
-        e4 = self.enc4(self.pool3(e3))
-        e4p = nn.functional.pad(e4, (0, 1))         # 4->5
-        e5 = self.enc5(self.pool4(e4p))
-
-        u = self.up(e5)                             # -> 125x10
-        # Align the decoder feature map with the skip connection.
-        u = nn.functional.interpolate(u, size=(125, 9), mode="nearest")
-        d1 = self.dec1(torch.cat([u, e4], dim=1))
-        d2 = self.up2(d1)
-        d2 = nn.functional.interpolate(d2, size=e3.shape[-2:], mode="bilinear", align_corners=False)
-        d2 = self.dec2(torch.cat([d2, e3], dim=1))
-        d3 = self.up3(d2)
-        d3 = nn.functional.interpolate(d3, size=e2p.shape[-2:], mode="bilinear", align_corners=False)
-        d3 = self.dec3(torch.cat([d3, e2p], dim=1))
-        d4 = self.up4(d3)
-        d4 = nn.functional.interpolate(d4, size=e1.shape[-2:], mode="bilinear", align_corners=False)
-        d4 = self.dec4(torch.cat([d4, e1], dim=1))
-        d5 = nn.functional.interpolate(d4, size=(Cfg.img_size, Cfg.img_size),
-                        mode="bilinear", align_corners=False)
-        d5 = self.dec5(d5)
-        out = self.head(d5)
-        return out.squeeze(1)                       # (B, 70, 70)
-
-
-# ---------------------------------------------------------------------------
-# Training and validation loops
-# ---------------------------------------------------------------------------
-def train_one_epoch(model, loader, optimizer, criterion, device):
-    """Run one training epoch and return the sample-weighted mean loss."""
-    model.train()
-    total, n = 0.0, 0
-    progress = tqdm(loader, desc="train", leave=False)
-    for seis, vel in progress:
-        seis, vel = seis.to(device), vel.to(device)
-        # seis: (B,5,1000,70)  vel: (B,70,70) or (B,1,70,70)
-        vel = vel.squeeze(1) if vel.dim() == 4 else vel
-
-        pred = model(seis)
-        loss = criterion(pred, vel)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        bs = seis.size(0)
-        total += loss.item() * bs
-        n += bs
-        progress.set_postfix(loss=f"{loss.item():.4f}")
-        # Release intermediate tensors so DataParallel gather buffers do not
-        # accumulate in host memory across the epoch.
-        del seis, vel, pred, loss
-    return total / max(n, 1)
-
-
-@torch.no_grad()
-def validate(model, loader, criterion, device):
-    """Evaluate the model and return the sample-weighted mean validation loss."""
-    model.eval()
-    total, n = 0.0, 0
-    progress = tqdm(loader, desc="valid", leave=False)
-    for seis, vel in progress:
-        seis, vel = seis.to(device), vel.to(device)
-        vel = vel.squeeze(1) if vel.dim() == 4 else vel
-        pred = model(seis)
-        loss = criterion(pred, vel)
-        bs = seis.size(0)
-        total += loss.item() * bs
-        n += bs
-        progress.set_postfix(loss=f"{loss.item():.4f}")
-        del seis, vel, pred, loss
-    return total / max(n, 1)
-
-
-def log_memory_state(epoch, args):
-    """Print host, system, and CUDA memory usage for one epoch."""
-    if not args.log_memory:
-        return
-    rss_mb = current_rss_mb()
-    if rss_mb is not None:
-        print(f"[mem] epoch {epoch:03d}  host_rss={rss_mb:.0f} MiB")
-    if psutil is not None:
-        virtual = psutil.virtual_memory()
-        print(
-            f"[mem] epoch {epoch:03d}  "
-            f"sys_available={virtual.available/1024**2:.0f} MiB  "
-            f"sys_used={virtual.used/1024**2:.0f} MiB"
-        )
-    if Cfg.device.startswith("cuda"):
-        print(
-            f"[mem] epoch {epoch:03d}  "
-            f"cuda_allocated={torch.cuda.memory_allocated()/1024**2:.0f} MiB  "
-            f"cuda_reserved={torch.cuda.memory_reserved()/1024**2:.0f} MiB"
-        )
-
-
-def create_run_dir(output_root):
-    """Create a timestamped directory for one training run's artifacts."""
-    timestamp = datetime.now().strftime("%y%m%d_%H%M")
-    run_dir = Path(output_root) / f"model_{timestamp}"
-    suffix = 1
-    while run_dir.exists():
-        run_dir = Path(output_root) / f"model_{timestamp}_{suffix:02d}"
-        suffix += 1
-    run_dir.mkdir(parents=True)
-    return run_dir
-
-
-def save_json(path, data):
-    """Write JSON data while converting pathlib values to strings."""
-    with open(path, "w") as file:
-        json.dump(data, file, indent=2, default=str)
-
-
-def save_mae_curve(history, path):
-    """Save normalized and raw train/validation MAE curves as a PNG."""
-    epochs = [item["epoch"] for item in history]
-    figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-
-    axes[0].plot(epochs, [item["train_mae_norm"] for item in history], label="train")
-    axes[0].plot(epochs, [item["val_mae_norm"] for item in history], label="validation")
-    axes[0].set_title("Normalized MAE")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("MAE")
-    axes[0].grid(alpha=0.3)
-    axes[0].legend()
-
-    axes[1].plot(epochs, [item["train_mae_raw"] for item in history], label="train")
-    axes[1].plot(epochs, [item["val_mae_raw"] for item in history], label="validation")
-    axes[1].set_title("Raw-unit MAE")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("MAE")
-    axes[1].grid(alpha=0.3)
-    axes[1].legend()
-
-    figure.tight_layout()
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
-
+from config import Cfg, load_velocity_stats, resolve_device, select_families, stats_path_for_families
+from data import SeisVelDataset, build_flat_indices, find_pairs
+from model import UNet
+from training import train_one_epoch, unwrap_model, validate, wrap_model_for_parallel
+from utils import create_run_dir, log_memory_state, save_json, save_mae_curve
 
 # ---------------------------------------------------------------------------
 # Command-line entry point
@@ -419,6 +70,7 @@ def main():
         help="Print host and CUDA memory usage after each epoch.",
     )
     args = parser.parse_args()
+    device = resolve_device()
     selected_families = select_families(args.family)
     stats_path = Path(args.stats_path) if args.stats_path else stats_path_for_families(
         selected_families
@@ -473,9 +125,9 @@ def main():
                               num_workers=args.num_workers, pin_memory=use_pin_memory)
 
     # Build the model, optimizer, scheduler, and loss function.
-    model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(Cfg.device)
+    model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(device)
     model, resolved_parallel_mode = wrap_model_for_parallel(
-        model, args.parallel_mode, Cfg.device
+        model, args.parallel_mode, str(device)
     )
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[info] model params: {n_params/1e6:.2f}M")
@@ -488,8 +140,8 @@ def main():
     best_epoch = None
     history = []
     for epoch in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, Cfg.device)
-        va_loss = validate(model, val_loader, criterion, Cfg.device)
+        tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        va_loss = validate(model, val_loader, criterion, device)
         scheduler.step()
         log_memory_state(epoch, args)
         gc.collect()
@@ -540,11 +192,11 @@ def main():
         "source": stats_path,
     })
     save_json(run_dir / "results.json", {
-        "run_dir": run_dir,
-        "device": Cfg.device,
+        "run_dir": str(run_dir),
+        "device": str(device),
         "parallel_mode_requested": args.parallel_mode,
         "parallel_mode_resolved": resolved_parallel_mode,
-        "gpu_count": torch.cuda.device_count() if Cfg.device.startswith("cuda") else 0,
+        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
         "model": "UNet",
         "model_base_channels": Cfg.model_base_channels,
         "parameter_count": n_params,

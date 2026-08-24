@@ -13,13 +13,17 @@ Kaggle competition. The model maps five-source seismic measurements to a
 │   ├── test/
 │   └── sample_submission.csv
 ├── working_space/
-│   ├── config.py         # Shared paths and hyperparameters
-│   ├── train.py          # Dataset, U-Net, training, and validation
-│   ├── infer.py          # Test inference and submission generation
-│   ├── compute_stats.py  # Velocity normalization statistics
-│   ├── test_unet.py      # U-Net forward/backward smoke test
-│   └── smoke_test.py     # Data pairing and submission format test
-└── output/               # Training run artifacts
+│   ├── config.py       # Shared paths, hyperparameters, and path resolution
+│   ├── data.py         # File pairing, lazy dataset, and sample indices
+│   ├── model.py        # U-Net architecture
+│   ├── training.py     # Train/validate loops and parallelization helpers
+│   ├── utils.py        # Memory logging and artifact persistence
+│   ├── train.py        # Training entry point
+│   ├── infer.py        # Test inference and submission generation
+│   ├── compute_stats.py# Velocity normalization statistics
+│   ├── test_unet.py    # U-Net shape/gradient smoke test
+│   └── smoke_test.py   # Data pairing and submission format test
+└── output/             # Training run artifacts
 ```
 
 ## Data Format
@@ -38,7 +42,7 @@ train_samples/
 Typical tensor shapes are:
 
 ```text
-Seismic input:  (N, 5, 1000, 70)
+Seismic input:   (N, 5, 1000, 70)
 Velocity target: (N, 70, 70) or (N, 1, 70, 70)
 Test sample:     (5, 1000, 70)
 ```
@@ -80,29 +84,69 @@ python working_space/train.py
 python working_space/infer.py
 ```
 
-The statistics command reports and saves the velocity mean and standard
-deviation. Training automatically loads the JSON statistics file for the
-selected family, so `Cfg.vel_mean` and `Cfg.vel_std` are only fallback values.
-
-To override selected settings:
+### 1. Compute normalization statistics
 
 ```powershell
-python working_space/train.py --epochs 30 --batch_size 8
-python working_space/train.py --parallel_mode data_parallel
-python working_space/infer.py --batch_size 4
+python working_space/compute_stats.py
+python working_space/compute_stats.py --family flatfault_a
+```
+
+The statistics command saves a JSON file under `output/stats/`. Training loads
+it automatically for the selected families, so `Cfg.vel_mean` and `Cfg.vel_std`
+are only fallback values. If the file is missing, training prints a warning and
+falls back to the configured values.
+
+### 2. Train
+
+```powershell
+python working_space/train.py
 python working_space/train.py --family flatfault_a
-python working_space/train.py --family fault
-python working_space/train.py --family flatfault_a,curvevel_a
+python working_space/train.py --family all --epochs 30 --batch_size 8
 ```
 
 The `--family` option performs case-insensitive substring matching against the
-configured family names. Omitting it or using `all` trains on every family.
+configured family names:
+
+```powershell
+python working_space/train.py --family fault                # all fault families
+python working_space/train.py --family flatfault_a,curvevel_a
+python working_space/train.py --family all                  # every family
+```
+
 When a family is selected and no `--out_dir` is provided, results are written
 to a matching subdirectory under `output` to avoid overwriting another run.
 
-Each training command creates a timestamped run directory under the selected
-output root. The directory name is `model_YYMMDD_HHMM`; a numeric suffix is
-added if the same minute is used more than once. A run contains:
+### 3. Run inference
+
+```powershell
+python working_space/infer.py \
+    --ckpt output/model_YYMMDD_HHMM/best_unet.pth
+```
+
+### Recommended memory-safe training settings
+
+On Kaggle with limited host memory, prefer:
+
+```powershell
+python working_space/train.py \
+    --family all \
+    --batch_size 4 \
+    --num_workers 0 \
+    --parallel_mode single
+```
+
+- `--num_workers 0` removes DataLoader worker host-memory overhead.
+- `--parallel_mode single` uses one GPU and is stable on host RSS. The
+  `data_parallel` mode uses multiple GPUs but can grow host RSS on multi-GPU T4
+  via scatter/gather buffers, so it should be verified before a long run.
+- `--log_memory` prints host and CUDA memory after each epoch so leaks can be
+  detected early.
+
+## Training Run Artifacts
+
+Each training command creates a timestamped run directory. The name is
+`model_YYMMDD_HHMM`; a numeric suffix is added if the same minute is used more
+than once. A run contains:
 
 ```text
 output/model_YYMMDD_HHMM/
@@ -110,24 +154,23 @@ output/model_YYMMDD_HHMM/
 ├── config.json         # Effective arguments and shared configuration
 ├── history.json        # Per-epoch normalized and raw-unit MAE
 ├── mae_curve.png       # Normalized and raw-unit MAE curves
-└── results.json        # Dataset, model, timing, and best-result summary
+├── results.json        # Dataset, model, timing, and best-result summary
+└── velocity_stats.json # mean/std actually used for normalization
 ```
 
 The output directory can be changed with `--out_dir` or
-`WAVEFORM_OUTPUT_ROOT`. Pass the resulting checkpoint explicitly to inference:
+`WAVEFORM_OUTPUT_ROOT`. Pass the resulting checkpoint explicitly to inference.
 
-```powershell
-python working_space/infer.py \
-    --ckpt output/model_YYMMDD_HHMM/best_unet.pth
-```
+## Parallel Modes
 
-The training entry point supports `single` and `data_parallel` modes. In
-`data_parallel` mode, one GPU is used when only one is available and multiple
-CUDA GPUs are used through PyTorch `DataParallel` when available. Checkpoints
-are saved without the `module.` prefix, so they remain compatible with single-
-GPU inference. The `ddp` mode is reserved as a future distributed-training
-backend and currently reports an explicit error rather than silently running a
-different configuration.
+The training entry point accepts `single`, `data_parallel`, and `ddp`:
+
+- `single` (default): one device; stable on host memory.
+- `data_parallel`: uses `nn.DataParallel` across available CUDA GPUs. When only
+  one GPU is available it degrades to `single`. Checkpoints are saved without
+  the `module.` prefix, so they load fine with a single-GPU model.
+- `ddp`: reserved as a future distributed-training backend; it currently
+  reports an explicit error instead of running a different configuration.
 
 ## Kaggle Usage
 
@@ -151,7 +194,8 @@ explicitly:
 ```
 
 The training and validation loops display progress through `tqdm.auto`,
-which works in both notebooks and terminals.
+which works in both notebooks and terminals. Set `TQDM_DISABLE=1` to suppress
+progress bars in long subprocess runs.
 
 ## Tests
 
@@ -178,7 +222,7 @@ For each test object, the inference script writes 70 rows named
 ## Notes
 
 - The training loss is L1 loss on normalized velocity maps. Training logs also
-    report `val_mae_raw` in the original velocity units.
+  report `val_mae_raw` in the original velocity units.
 - The seismic input is transformed with `log1p(abs(x))`.
 - Training uses a file-level train/validation split to reduce leakage between
   samples from the same file.

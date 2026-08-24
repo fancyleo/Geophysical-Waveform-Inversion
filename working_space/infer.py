@@ -23,9 +23,9 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from working_space.train import UNet, Cfg   # Reuse the model and shared configuration.
-from working_space.config import load_velocity_stats
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from model import UNet
+from config import Cfg, load_velocity_stats, resolve_device
 
 # ---------------------------------------------------------------------------
 # Test dataset
@@ -38,7 +38,7 @@ class TestDataset(Dataset):
         self.files = sorted(glob.glob(os.path.join(test_dir, "*.npy")))
         if len(self.files) == 0:
             raise RuntimeError(f"No .npy files found in {test_dir}")
-        # 提取 oid
+        # Extract object IDs from filenames.
         self.oids = [os.path.splitext(os.path.basename(f))[0] for f in self.files]
         print(f"[info] test files: {len(self.files)}")
 
@@ -83,10 +83,7 @@ def main():
         args.vel_mean, args.vel_std = load_velocity_stats(stats_path)
         print(f"[info] loaded velocity statistics: {stats_path}")
 
-    device_name = Cfg.device
-    if device_name == "auto":
-        device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device_name)
+    device = resolve_device()
 
     # Load the trained model.
     model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(device)
