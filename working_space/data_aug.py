@@ -97,16 +97,22 @@ def time_shift(seismic, velocity, rng, prob=0.5, max_shift=100, **kwargs):
     """Shift the time axis (source excitation delay) with zero padding.
 
     Physical basis: changing when the source fires shifts the whole trace in
-    time without changing the subsurface. Uses pad + slice instead of
-    ``np.roll`` so the waveform does not wrap around (non-physical).
+    time without changing the subsurface. Uses a preallocated zero buffer and
+    in-place slice copy (instead of ``np.pad`` + slice) so the waveform does not
+    wrap around AND the returned array is exactly (n_steps,) sized. This avoids
+    a large per-sample temporary, which matters because with num_workers=0 every
+    temporary is allocated in the rank process and feeds host-RSS growth.
     """
     if rng.random() < prob:
         shift = int(rng.integers(-max_shift, max_shift + 1))
         if shift != 0:
             n_steps = seismic.shape[1]
-            padded = np.pad(seismic, ((0, 0), (max_shift, max_shift), (0, 0)))
-            start = max_shift + shift
-            seismic = padded[:, start:start + n_steps, :]
+            shifted = np.zeros_like(seismic)
+            if shift > 0:
+                shifted[:, :n_steps - shift, :] = seismic[:, shift:, :]
+            else:
+                shifted[:, -shift:, :] = seismic[:, :n_steps + shift, :]
+            seismic = shifted
     return seismic, velocity
 
 

@@ -19,3 +19,6 @@ working_space/test.ipynb
 output/
 kaggle_output/
 stats/
+
+# Copilot setup
+.github/

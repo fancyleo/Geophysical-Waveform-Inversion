@@ -40,7 +40,25 @@ from training import (
     validate,
     wrap_model_for_parallel,
 )
-from utils import create_run_dir, current_rss_mb, log_memory_state, save_json, save_mae_curve
+from utils import (
+    create_run_dir,
+    current_rss_mb,
+    log_memory_state,
+    memory_snapshot,
+    save_json,
+    save_mae_curve,
+)
+
+# Ask glibc to return freed host memory to the OS promptly instead of keeping it
+# in the process heap. With num_workers=0 every per-sample numpy temporary is
+# allocated in the rank process, so without this the heap (and thus host RSS)
+# climbs across epochs under DDP even though nothing is truly leaked. These are
+# inherited by mp.spawn'd children (fork inherits malloc tuning; spawn re-reads
+# the env vars at startup), so they must be set before spawning.
+os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")   # trim heap when >=128KB is free
+os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "131072")   # large allocs via mmap -> returned on free
+os.environ.setdefault("MALLOC_TOP_PAD_", "65536")           # keep ~64KB headroom after a trim
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")              # cap arenas so freed memory coalesces
 
 # ---------------------------------------------------------------------------
 # Command-line entry point
@@ -227,12 +245,10 @@ def train_worker(local_rank, world_size, args):
         if is_main_process():
             log_memory_state(epoch, args, rss_baseline)
         if args.log_memory and is_main_process():
-            memory_series.append({
-                "epoch": epoch,
-                "host_rss": current_rss_mb(),
-                "cuda_allocated": torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else None,
-                "cuda_reserved": torch.cuda.memory_reserved() / 1024**2 if torch.cuda.is_available() else None,
-            })
+            # Snapshot host RSS/uss/data and CUDA allocated/reserved/pinned so
+            # results.json can attribute any RSS growth to a true leak (uss up),
+            # malloc fragmentation (data up, uss flat), or page-cache warm-up.
+            memory_series.append({"epoch": epoch, **memory_snapshot()})
         gc.collect()
         train_mae_raw = tr_loss * vel_std
         val_mae_raw = va_loss * vel_std

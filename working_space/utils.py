@@ -20,26 +20,66 @@ def current_rss_mb():
     return psutil.Process().memory_info().rss / 1024**2
 
 
+def memory_snapshot():
+    """Return a dict of host and CUDA memory metrics for leak diagnostics.
+
+    ``host_uss`` (unique set size) excludes pages shared with other processes
+    (mmap'd data files, NCCL shared segments), so its growth indicates a true
+    per-process leak rather than shared page-cache warm-up. ``host_data`` is
+    the malloc-managed heap/brk size, which is what glibc refuses to return to
+    the OS when free lists fragment. ``cuda_host_pinned_mb`` tracks the CUDA
+    host pinned pool used by DDP/NCCL, which is invisible to ``memory_allocated``.
+    """
+    snapshot = {}
+    if psutil is not None:
+        info = psutil.Process().memory_full_info()
+        snapshot["host_rss_mb"] = info.rss / 1024**2
+        uss = getattr(info, "uss", None)
+        snapshot["host_uss_mb"] = uss / 1024**2 if uss is not None else None
+        data = getattr(info, "data", None)
+        snapshot["host_data_mb"] = data / 1024**2 if data is not None else None
+    if torch.cuda.is_available():
+        snapshot["cuda_allocated_mb"] = torch.cuda.memory_allocated() / 1024**2
+        snapshot["cuda_reserved_mb"] = torch.cuda.memory_reserved() / 1024**2
+        stats = torch.cuda.memory_stats()
+        pinned = stats.get("host_allocated_bytes") or 0
+        snapshot["cuda_host_pinned_mb"] = pinned / 1024**2
+    return snapshot
+
+
 def log_memory_state(epoch, args, rss_baseline=None):
     """Print host and CUDA memory usage for one epoch.
 
     When ``rss_baseline`` is given, also prints the per-epoch host RSS delta so
     slow leaks are visible without flooding the log with system-wide fields.
+    Also prints ``uss`` (excludes shared mmap pages) and the CUDA host pinned
+    pool so a growing RSS can be attributed to a true leak vs. malloc
+    fragmentation vs. page-cache warm-up.
     """
     if not args.log_memory:
         return
 
-    rss_mb = current_rss_mb()
+    snapshot = memory_snapshot()
+    rss_mb = snapshot.get("host_rss_mb")
     if rss_mb is not None:
         message = f"[mem] epoch {epoch:03d}  host_rss={rss_mb:.0f} MiB"
         if rss_baseline is not None:
             message += f"  delta={rss_mb - rss_baseline:+.0f} MiB"
+        uss = snapshot.get("host_uss_mb")
+        if uss is not None:
+            message += f"  uss={uss:.0f} MiB"
+        data = snapshot.get("host_data_mb")
+        if data is not None:
+            message += f"  data={data:.0f} MiB"
+        pinned = snapshot.get("cuda_host_pinned_mb")
+        if pinned is not None:
+            message += f"  host_pinned={pinned:.0f} MiB"
         print(message)
     if torch.cuda.is_available():
         print(
             f"[mem] epoch {epoch:03d}  "
-            f"cuda_allocated={torch.cuda.memory_allocated()/1024**2:.0f} MiB  "
-            f"cuda_reserved={torch.cuda.memory_reserved()/1024**2:.0f} MiB"
+            f"cuda_allocated={snapshot['cuda_allocated_mb']:.0f} MiB  "
+            f"cuda_reserved={snapshot['cuda_reserved_mb']:.0f} MiB"
         )
 
 
