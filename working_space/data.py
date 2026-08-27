@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from config import Cfg
-from data_aug import apply_augmentation
+from pretrain import apply_augmentation
 
 
 def find_fault_pairs(family_dir):

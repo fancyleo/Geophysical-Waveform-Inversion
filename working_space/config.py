@@ -147,9 +147,9 @@ class Cfg:
 
     # Data augmentation (train only; applied to raw physical traces before
     # abs/log1p and velocity normalization). Each key maps to params passed to
-    # the matching function in data_aug.py; "prob" is the apply probability.
+    # the matching function in pretrain.py; "prob" is the apply probability.
     # Set prob to 0 or remove a key to disable that augmentation. To add a new
-    # one, write it in data_aug.py with @register_aug("name") and enable here.
+    # one, write it in pretrain.py with @register_aug("name") and enable here.
     augmentations = {
         "xflip": {"prob": 0.5},
         "time_shift": {"prob": 0.5, "max_shift": 100},
