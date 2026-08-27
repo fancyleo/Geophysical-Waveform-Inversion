@@ -1,0 +1,32 @@
+[project]
+name = "geophysical-waveform-inversion"
+version = "0.1.0"
+description = "Geophysical Waveform Inversion (Kaggle-style GPU env, Aliyun workflow)"
+readme = "README.md"
+authors = [
+    { name = "fancyleo", email = "liulongxiaoleo@gmail.com" }
+]
+requires-python = ">=3.11, <3.13"
+
+# Core runtime deps (6 explicit; the rest are resolved automatically)
+dependencies = [
+    "jupyter>=1.1.1",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
+    "scikit-learn>=1.9.0",
+    "tqdm>=4.70.0",
+    # PyTorch CUDA build (the Kaggle GPU image ships CUDA 12.5; cu121 wheels are
+    # forward-compatible). Note: the Kaggle image usually has torch preinstalled;
+    # if the version matches you can remove these to avoid reinstalling.
+    "torch>=2.5.1",
+    "torchaudio>=2.5.1",
+    "torchvision>=0.20.1",
+]
+
+[project.scripts]
+geophysical-waveform-inversion = "geophysical_waveform_inversion:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"

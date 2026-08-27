@@ -120,7 +120,7 @@ def main():
                 "x_41,x_43,x_45,x_47,x_49,x_51,x_53,x_55,x_57,x_59,"
                 "x_61,x_63,x_65,x_67,x_69\n")
         for i, oid in enumerate(oid_list):
-            for y in range(odd_cols.shape[1]):     # 70 行
+            for y in range(odd_cols.shape[1]):     # 70 rows
                 row_vals = ",".join(f"{v:.1f}" for v in odd_cols[i, y])
                 f.write(f"{oid}_y_{y},{row_vals}\n")
     print(f"[done] saved → {out_path}")

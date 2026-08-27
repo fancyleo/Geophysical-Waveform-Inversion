@@ -1,0 +1,72 @@
+# ============================================================
+# Aliyun Kaggle continue-training workflow - Docker Compose orchestration
+# Architecture:
+#   CPU container (downloader) --writes--> ESSD(/data/kaggle) <--attach-- GPU container (gpu-train)
+#   The ESSD block device /dev/sdb is mounted on the host at ${DATA_MOUNT} (default /data);
+#   after the CPU download finishes it is detached, then attached to the GPU machine for training.
+# ============================================================
+
+services:
+  # ----------------------------------------------------------
+  # CPU downloader: downloads and preprocesses kaggle data, writing to the ESSD
+  # Runs on a CPU machine (e.g. Aliyun ECS shared/compute type); the ESSD must
+  # already be mounted on the host at ${DATA_MOUNT}
+  # ----------------------------------------------------------
+  downloader:
+    build: ./downloader
+    container_name: kaggle-downloader
+    profiles: ["downloader"]
+    volumes:
+      # ESSD (host ${DATA_MOUNT:-/data}): input writable (download), working writable (preprocess)
+      - ${DATA_MOUNT:-/data}/kaggle/input:/data/kaggle/input
+      - ${DATA_MOUNT:-/data}/kaggle/working:/data/kaggle/working
+      # Kaggle API credentials
+      - ./kaggle-api/kaggle.json:/root/.kaggle/kaggle.json:ro
+      # Preprocess/download scripts
+      - ./scripts:/scripts:ro
+    environment:
+      - KAGGLE_CONFIG_DIR=/root/.kaggle
+      - KAGGLE_COMPETITION=${KAGGLE_COMPETITION:-geophysical-waveform-inversion}
+      - DOWNLOAD_DIR=/data/kaggle/input
+      - WORKING_DIR=/data/kaggle/working
+    # Default: download + preprocess; can be overridden via command
+    command: ["bash", "/scripts/download.sh"]
+
+  # ----------------------------------------------------------
+  # GPU training container: Kaggle style, mounts ESSD input (ro) + working (rw)
+  # Runs on a GPU machine (e.g. Aliyun ecs.gn7i / Lingjun cluster); you must
+  # first detach the ESSD from the CPU machine, attach it here, and mount it at
+  # ${DATA_MOUNT}
+  # Note: build.context = .. (repo root) because gpu/Dockerfile needs to COPY
+  #       working_space/ training code and gpu/requirements-gpu.txt;
+  #       combined with the repo-root .dockerignore excluding input/ and other
+  #       large directories to keep the build context small.
+  # ----------------------------------------------------------
+  gpu-train:
+    build:
+      context: ..
+      dockerfile: dockerfile/gpu/Dockerfile
+    container_name: kaggle-gpu-train
+    profiles: ["gpu"]
+    runtime: nvidia          # use the NVIDIA Container Runtime
+    shm_size: "16g"          # shared memory, avoids DataLoader bottlenecks
+    ports:
+      - "8888:8888"          # JupyterLab
+      # - "2222:22"          # optional SSH (image has no sshd; enable it first)
+    volumes:
+      # input read-only: dataset (downloaded by CPU), prevents the training container from modifying it
+      - ${DATA_MOUNT:-/data}/kaggle/input:/kaggle/input:ro
+      # working writable: model checkpoints, logs, .download_complete marker
+      - ${DATA_MOUNT:-/data}/kaggle/working:/kaggle/working
+      # Optional: hot-reload local code (overrides the /kaggle/code baked into the image; enable while iterating)
+      # - ./working_space:/kaggle/code:rw
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - PYTHONPATH=/kaggle/code
+      # Let config.resolve_data_root() hit the ESSD data root directly (/kaggle/input
+      # contains train_samples/ test/ sample_submission.csv flat)
+      - WAVEFORM_DATA_ROOT=/kaggle/input
+      - WAVEFORM_OUTPUT_ROOT=/kaggle/working
+    # command is exec'd by the image's entrypoint.sh
+    command: ["jupyter", "lab", "--ip=0.0.0.0", "--no-browser", "--notebook-dir=/kaggle", "--ServerApp.allow_remote_access=True"]

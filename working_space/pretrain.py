@@ -1,26 +1,29 @@
-"""pretrain.py — 预训练/训练阶段的基础数据增强。
+"""pretrain.py — basic data augmentation for the pretrain/training pipeline.
 
-将原 ``data_aug.py`` 重写为 ``pretrain`` 模块，实现地震波形反演的基础数据增强。
+The original ``data_aug.py`` was rewritten as the ``pretrain`` module,
+implementing basic data augmentation for seismic waveform inversion.
 
-设计约定
---------
-每个增强是一个纯函数，签名为::
+Design conventions
+------------------
+Every augmentation is a pure function with the signature::
 
     fn(seismic: np.ndarray (n_src, n_steps, n_recv),
        velocity: np.ndarray (70, 70),
        rng: np.random.Generator, **params) -> (seismic, velocity)
 
-函数通过 ``@register_aug("short_name")`` 注册，可在 ``config.py`` 的
-``Cfg.augmentations`` 中按名字开关，无需改动本模块的调度逻辑。
+Functions are registered with ``@register_aug("short_name")`` and can be
+toggled by name via ``Cfg.augmentations`` in ``config.py``, without touching
+this module's dispatch logic.
 
-增强作用于 *原始物理量*（seismic 在做 ``abs``/``log1p`` 之前、velocity 在做
-均值/标准差归一化之前），以保证时间平移、幅值缩放、加噪等物理变换的有效性。
+Augmentations operate on the *raw physical quantities* — the seismic trace
+before ``abs``/``log1p`` and the velocity before mean/std normalization — so
+physics-based transforms (time shift, amplitude scaling, noise) stay valid.
 
-新增一个增强的步骤
-------------------
-1. 在本文件写一个签名为上面的函数。
-2. 用 ``@register_aug("short_name")`` 装饰。
-3. 在 ``config.py`` 的 ``Cfg.augmentations`` 中启用::
+How to add a new augmentation
+-----------------------------
+1. Write a function with the signature above in this file.
+2. Decorate it with ``@register_aug("short_name")``.
+3. Enable it in ``Cfg.augmentations`` in ``config.py``::
 
        "short_name": {"prob": 0.5, "any_param": value}
 """
@@ -31,7 +34,7 @@ _AUGMENTATIONS = {}
 
 
 def register_aug(name):
-    """把 ``name`` 注册为一个数据增强函数。"""
+    """Register ``name`` as a data augmentation function."""
 
     def decorator(fn):
         _AUGMENTATIONS[name] = fn
@@ -41,27 +44,27 @@ def register_aug(name):
 
 
 def get_augmentation(name):
-    """按名字返回已注册的增强函数。"""
+    """Return the registered augmentation function by name."""
     return _AUGMENTATIONS[name]
 
 
 def augmentation_names():
-    """返回所有已注册增强的名字列表。"""
+    """List the names of all registered augmentations."""
     return list(_AUGMENTATIONS)
 
 
 def apply_augmentation(seismic, velocity, config, rng, enabled=True):
-    """按配置顺序依次应用增强。
+    """Apply the configured augmentations in order.
 
     Args:
-        seismic: 原始地震样本，shape (n_src, n_steps, n_recv)。
-        velocity: 原始速度模型，shape (70, 70)。
-        config: dict 映射 增强名 -> 参数（必须含 "prob"）。
-        rng: numpy Generator，所有变换共用以保证可复现。
-        enabled: 设为 False 跳过全部增强（用于验证集）。
+        seismic: raw seismic sample, shape (n_src, n_steps, n_recv).
+        velocity: raw velocity model, shape (70, 70).
+        config: dict mapping augmentation name -> params (must include "prob").
+        rng: numpy Generator shared by every transform for reproducibility.
+        enabled: set False to skip all augmentations (used for validation).
 
     Returns:
-        (seismic, velocity) 应用增强后的结果。
+        (seismic, velocity) after applying the enabled augmentations.
     """
     if not enabled or not config:
         return seismic, velocity
@@ -74,33 +77,36 @@ def apply_augmentation(seismic, velocity, config, rng, enabled=True):
 
 
 def augment_sample(seismic, velocity, config, seed=0):
-    """用固定种子应用配置的增强流程，返回 (raw, augmented)。
+    """Apply the configured pipeline with a fixed seed; returns (raw, augmented).
 
-    便于测试/可视化：给定一个原始样本，得到增强前后的两份拷贝做对比。
+    Useful for testing/visualization: given one raw sample, get the raw and
+    augmented copies for comparison.
     """
     rng = np.random.default_rng(seed)
     augmented_seismic, augmented_velocity = apply_augmentation(
         seismic, velocity, config, rng, enabled=True
     )
-    # 翻转/平移可能产生负 stride 的 view，统一转成 C 连续以便显示与 torch 使用。
+    # Flips/shifts can produce views with negative strides; restore C-contiguous buffers for display and torch usage.
     augmented_seismic = np.ascontiguousarray(augmented_seismic)
     augmented_velocity = np.ascontiguousarray(augmented_velocity)
     return (seismic, velocity), (augmented_seismic, augmented_velocity)
 
 
 # ---------------------------------------------------------------------------
-# 第一梯队 - 几何类增强（低风险，收益最高）
+# Tier 1 - geometry augmentations (low risk, highest value)
 # ---------------------------------------------------------------------------
 
 @register_aug("xflip")
 def xflip(seismic, velocity, rng, prob=0.5, **kwargs):
-    """沿接收器轴镜像，速度模型同步镜像。
+    """Mirror the receiver axis and the matching velocity axis.
 
-    物理依据：把线性接收阵列放到镜像位置观测是合法观测几何，因此左右翻转
-    波形并镜像速度模型即可得到新的真实样本。
+    Physical basis: observing with a linear receiver array from the mirrored
+    position is a valid acquisition geometry, so flipping the waveform
+    left-right and mirroring the velocity model yields a realistic new sample.
 
-    NOTE: 假定 ``velocity[:, i]`` 沿接收器（水平）轴变化。若可视化发现水平轴
-    是第一维，需把速度翻转改为 ``velocity[::-1, :]``。
+    NOTE: assumes ``velocity[:, i]`` varies along the receiver (horizontal)
+    axis. If a visualization shows the horizontal axis is the first dimension,
+    change the velocity flip to ``velocity[::-1, :]``.
     """
     if rng.random() < prob:
         seismic = seismic[..., ::-1]
@@ -110,12 +116,14 @@ def xflip(seismic, velocity, rng, prob=0.5, **kwargs):
 
 @register_aug("time_shift")
 def time_shift(seismic, velocity, rng, prob=0.5, max_shift=100, **kwargs):
-    """时间轴平移（震源激发延迟），零填充。
+    """Shift the time axis (source excitation delay) with zero padding.
 
-    物理依据：震源激发时刻改变会整体平移时程而不改变地下介质。用预分配的零
-    缓冲 + 原位切片拷贝（而非 ``np.pad``+切片），既避免波形回绕，又让返回数组
-    恰好为 (n_steps,) 大小，减少每样本临时内存（num_workers=0 时会累积到
-    rank 进程的 host RSS）。
+    Physical basis: changing when the source fires shifts the whole trace in
+    time without changing the subsurface. Uses a preallocated zero buffer and
+    in-place slice copy (instead of ``np.pad`` + slice) so the waveform does not
+    wrap around AND the returned array is exactly (n_steps,) sized. This avoids
+    a large per-sample temporary, which matters because with num_workers=0 every
+    temporary is allocated in the rank process and feeds host-RSS growth.
     """
     if rng.random() < prob:
         shift = int(rng.integers(-max_shift, max_shift + 1))
@@ -131,14 +139,15 @@ def time_shift(seismic, velocity, rng, prob=0.5, max_shift=100, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# 第二梯队 - 统计类增强（低风险）
+# Tier 2 - statistical augmentations (low risk)
 # ---------------------------------------------------------------------------
 
 @register_aug("noise")
 def noise(seismic, velocity, rng, prob=0.5, sigma=0.01, **kwargs):
-    """叠加高斯观测噪声。
+    """Add Gaussian observation noise.
 
-    ``sigma`` 相对样本自身标准差取值，保证对不同幅值波形都稳健。
+    ``sigma`` is relative to the sample's own standard deviation so it stays
+    robust to different trace amplitudes.
     """
     if rng.random() < prob:
         noise_std = sigma * float(seismic.std())
@@ -150,7 +159,7 @@ def noise(seismic, velocity, rng, prob=0.5, sigma=0.01, **kwargs):
 
 @register_aug("receiver_dropout")
 def receiver_dropout(seismic, velocity, rng, prob=0.3, drop_ratio=0.15, **kwargs):
-    """随机置零一部分接收道（模拟死道）。"""
+    """Zero out a random subset of receiver traces (dead-channel simulation)."""
     if rng.random() < prob:
         n_recv = seismic.shape[-1]
         n_drop = max(1, int(n_recv * drop_ratio))
@@ -161,15 +170,16 @@ def receiver_dropout(seismic, velocity, rng, prob=0.3, drop_ratio=0.15, **kwargs
 
 
 # ---------------------------------------------------------------------------
-# 第三梯队 - 物理近似增强（中风险，建议 A/B 验证）
+# Tier 3 - physics-approximation augmentations (medium risk, verify by A/B)
 # ---------------------------------------------------------------------------
 
 @register_aug("amplitude_scale")
 def amplitude_scale(seismic, velocity, rng, prob=0.5, low=0.85, high=1.15, **kwargs):
-    """缩放波形幅值（震源强度变化）。
+    """Scale trace amplitudes (source-strength variation).
 
-    物理依据：对线性波动方程，更强/更弱的震源会线性缩放记录幅值而不改变速度。
-    因为这里不做归一化，幅值变化范围保持温和。
+    Physical basis: for the linear wave equation, a stronger/weaker source
+    scales the recorded amplitudes linearly without changing the velocity.
+    Keep the range modest because the traces are not normalized here.
     """
     if rng.random() < prob:
         scale = rng.uniform(low, high)
@@ -179,7 +189,7 @@ def amplitude_scale(seismic, velocity, rng, prob=0.5, low=0.85, high=1.15, **kwa
 
 @register_aug("source_dropout")
 def source_dropout(seismic, velocity, rng, prob=0.3, **kwargs):
-    """置零一个随机震源通道（多源冗余）。"""
+    """Zero out one random source channel (multi-source redundancy)."""
     if rng.random() < prob:
         src = int(rng.integers(0, seismic.shape[0]))
         seismic = seismic.copy()

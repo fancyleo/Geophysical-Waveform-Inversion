@@ -1,0 +1,30 @@
+# Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.python-version
+
+# VCS / IDE
+.git/
+.github/
+.vscode/
+
+# Large data / artifacts (must be excluded from the GPU build context to avoid sending hundreds of GB to the daemon)
+input/
+output/
+stats/
+kaggle_output/
+nas/
+dockerfile/nas/
+
+# Secrets (never ship these into the image)
+dockerfile/kaggle/
+dockerfile/kaggle-api/
+kaggle-api/
+
+# Training artifacts / local debug notebook
+*.pth
+*.pt
+*.ipynb_checkpoints/
+working_space/test.ipynb

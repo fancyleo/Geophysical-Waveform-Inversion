@@ -22,3 +22,6 @@ stats/
 
 # Copilot setup
 .github/
+
+# Kaggle token
+dockerfile/kaggle/access_token
