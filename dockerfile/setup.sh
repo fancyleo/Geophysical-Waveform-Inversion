@@ -23,7 +23,7 @@ echo "✓ docker-compose available"
 
 echo ""
 echo "===== [2/5] Creating the directory structure (ESSD mount point /data) ====="
-echo "  Please confirm the ESSD is mounted at /data: df -h | grep /data  (block device /dev/sdb)"
+echo "  Please confirm the ESSD is mounted at /data: df -h | grep /data  (block device /dev/vdb)"
 mkdir -p /data/kaggle/input
 mkdir -p /data/kaggle/working
 mkdir -p ./kaggle-api
@@ -52,7 +52,7 @@ echo "===== [5/5] Quick start commands ====="
 echo "  # Step 1: download data on the CPU machine (ESSD mounted at /data)"
 echo "  docker compose --profile downloader up --build"
 echo ""
-echo "  # Step 2: migrate the ESSD (umount+detach on the CPU machine -> attach on the GPU machine and mount /dev/sdb /data)"
+echo "  # Step 2: migrate the ESSD (umount+detach on the CPU machine -> attach on the GPU machine and mount /dev/vdb /data)"
 echo ""
 echo "  # Step 3: start training on the GPU machine"
 echo "  docker compose --profile gpu up --build -d"

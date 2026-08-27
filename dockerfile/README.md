@@ -10,7 +10,7 @@
 ```
 ┌────────────────────────┐   detach    ┌────────────────────┐   attach    ┌──────────────────────────┐
 │CPU Machine (ECS Shared)│ ──────────▶│Aliyun ESSD Disk    │ ──────────▶│GPU Machine (ECS gn7i)    │
-│downloader container    │ write+detach│/dev/sdb → /data    │ mount+train │gpu-train container       │
+│downloader container    │ write+detach│/dev/vdb → /data    │ mount+train │gpu-train container       │
 │- kaggle API download   │             │├─ input (ro)       │             │- JupyterLab :8888        │
 │- preprocess            │             │└─ working (rw)     │             │- /kaggle/input, /working │
 └────────────────────────┘             └────────────────────┘             └──────────────────────────┘
@@ -61,7 +61,7 @@
 ├── kaggle-api/
 │   └── kaggle.json           # ⚠️ Put your Kaggle API Token here
 │
-└── host /data                # ⚠️ ESSD block device /dev/sdb mounted to /data
+└── host /data                # ⚠️ ESSD block device /dev/vdb mounted to /data
     └── kaggle/
         ├── input/            # Dataset (written by CPU, read-only for GPU)
         └── working/          # Preprocessing artifacts + training output (both directions)
@@ -96,7 +96,7 @@ python validate.py
 
 ```bash
 # 0. First confirm the ESSD is mounted to /data
-df -h | grep /data    # /dev/sdb → /data
+df -h | grep /data    # /dev/vdb → /data
 
 # Method A: use docker-compose (recommended)
 docker compose --profile downloader up --build
@@ -115,11 +115,11 @@ When done, the `/data/kaggle/working/.download_complete` marker file will appear
 ```bash
 # 1. Unmount and detach the ESSD on the CPU machine (console/CLI both work)
 sudo umount /data
-# Console: Disk Management → unmount /dev/sdb
+# Console: Disk Management → unmount /dev/vdb
 
 # 2. Attach the ESSD to the GPU machine and mount it to /data
-sudo mkfs.ext4 /dev/sdb            # Format only the first time (this wipes the disk — be careful!)
-sudo mkdir -p /data && sudo mount /dev/sdb /data
+sudo mkfs.ext4 /dev/vdb            # Format only the first time (this wipes the disk — be careful!)
+sudo mkdir -p /data && sudo mount /dev/vdb /data
 df -h | grep /data                 # Confirm the mount succeeded
 
 # 3. Start the GPU training container
@@ -172,7 +172,7 @@ Prevents the training container from accidentally modifying the original dataset
 
 | Problem | Cause | Solution |
 |------|------|---------|
-| Container can't read data after ESSD migration | Forgot to remount /data | Confirm `df -h` on the GPU machine after `mount /dev/sdb /data`; compose uses `${DATA_MOUNT:-/data}` |
+| Container can't read data after ESSD migration | Forgot to remount /data | Confirm `df -h` on the GPU machine after `mount /dev/vdb /data`; compose uses `${DATA_MOUNT:-/data}` |
 | ESSD IO is slow | Single-disk performance is limited | Copy `input/` to the GPU machine's local NVMe before training, then write back checkpoints when done |
 | GPU container `torch.cuda.is_available()=False` | NVIDIA Container Toolkit not installed | Install `nvidia-container-toolkit` on the GPU machine and use `--gpus all` |
 | 100G download timeout | Kaggle API rate limiting | `download.sh` already uses `--resume`; just re-run to resume |

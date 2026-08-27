@@ -2,7 +2,7 @@
 # Aliyun Kaggle continue-training workflow - Docker Compose orchestration
 # Architecture:
 #   CPU container (downloader) --writes--> ESSD(/data/kaggle) <--attach-- GPU container (gpu-train)
-#   The ESSD block device /dev/sdb is mounted on the host at ${DATA_MOUNT} (default /data);
+#   The ESSD block device /dev/vdb is mounted on the host at ${DATA_MOUNT} (default /data);
 #   after the CPU download finishes it is detached, then attached to the GPU machine for training.
 # ============================================================
 
