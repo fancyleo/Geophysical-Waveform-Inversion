@@ -25,3 +25,12 @@ stats/
 
 # Kaggle token
 dockerfile/kaggle/access_token
+
+# Feature analyse
+working_space/feature*
+
+# Augment explore
+working_space/aug_explore.ipynb
+
+# Preflight
+working_space/preflight.ipynb

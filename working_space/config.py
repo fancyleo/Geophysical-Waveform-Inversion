@@ -109,6 +109,26 @@ def resolve_device(device=None):
     return torch.device(device)
 
 
+def _load_augmentations(path, default):
+    """Load augmentations from an optional JSON override file; fall back to default.
+
+    The override file is written by ``aug_config.write_winner_aug`` after the
+    augmentation exploration (aug_explore.ipynb), so formal training
+    (train.py / preflight.ipynb) can directly use the winning augmentation.
+    """
+    import json
+
+    try:
+        if path.is_file():
+            with open(path) as file:
+                data = json.load(file)
+            if isinstance(data, dict) and isinstance(data.get("augmentations"), dict):
+                return data["augmentations"]
+    except Exception as exc:  # defensive: never break training on a bad override
+        print(f"[warn] 读取增强覆盖文件失败({exc})，使用默认增强")
+    return default
+
+
 class Cfg:
     """Shared paths, dataset settings, model hyperparameters, and test options."""
 
@@ -150,14 +170,13 @@ class Cfg:
     # the matching function in pretrain.py; "prob" is the apply probability.
     # Set prob to 0 or remove a key to disable that augmentation. To add a new
     # one, write it in pretrain.py with @register_aug("name") and enable here.
-    augmentations = {
+    # NOTE: 若 output/aug_explore/winner_aug.json 存在，将自动覆盖以下默认值
+    #（由 aug_config.write_winner_aug 写回，供 train.py / preflight.ipynb 直接使用）。
+    _aug_override_path = project_root / "output" / "aug_explore" / "winner_aug.json"
+    augmentations = _load_augmentations(_aug_override_path, {
         "xflip": {"prob": 0.5},
         "time_shift": {"prob": 0.5, "max_shift": 100},
-        # "noise": {"prob": 0.5, "sigma": 0.01},
-        # "receiver_dropout": {"prob": 0.3, "drop_ratio": 0.15},
-        # "amplitude_scale": {"prob": 0.5, "low": 0.85, "high": 1.15},
-        # "source_dropout": {"prob": 0.3},
-    }
+    })
 
     # Target normalization; values computed for all 10 families via compute_stats.py.
     # train.py prefers the stats JSON in output/stats/ when it exists.
