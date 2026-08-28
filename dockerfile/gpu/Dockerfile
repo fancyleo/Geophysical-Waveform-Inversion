@@ -40,6 +40,12 @@ RUN useradd -m -d /kaggle -s /bin/bash kaggle \
 #    excludes large directories and secrets)
 COPY working_space/ /kaggle/code/
 
+# 2.1) Ship the augmentation-override file (no augmentation, from aug_explore) to the
+#      path config.py reads (/kaggle/output/aug_explore/winner_aug.json), so formal
+#      training uses no augmentation by default.
+RUN mkdir -p /kaggle/output/aug_explore
+COPY output/aug_explore/winner_aug.json /kaggle/output/aug_explore/winner_aug.json
+
 # 3) Install/lock remaining deps (torch/torchvision/torchaudio reused from the
 #    base image's cu121 build; do not reinstall)
 COPY dockerfile/gpu/requirements-gpu.txt /tmp/requirements-gpu.txt

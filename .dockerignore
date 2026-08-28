@@ -13,6 +13,9 @@ __pycache__/
 # Large data / artifacts (must be excluded from the GPU build context to avoid sending hundreds of GB to the daemon)
 input/
 output/
+# but always ship the augmentation-override file (sets "no augmentation" for training)
+!output/aug_explore/
+!output/aug_explore/winner_aug.json
 stats/
 kaggle_output/
 nas/

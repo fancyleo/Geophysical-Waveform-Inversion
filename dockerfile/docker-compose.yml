@@ -58,8 +58,10 @@ services:
       - ${DATA_MOUNT:-/data}/kaggle/input:/kaggle/input:ro
       # working writable: model checkpoints, logs, .download_complete marker
       - ${DATA_MOUNT:-/data}/kaggle/working:/kaggle/working
-      # Optional: hot-reload local code (overrides the /kaggle/code baked into the image; enable while iterating)
-      # - ./working_space:/kaggle/code:rw
+      # Hot-reload local code: mount the host repo's working_space directly to /kaggle/code so the
+      # latest code is used without rebuilding the image. Relative paths resolve against this compose
+      # file's dir (dockerfile/), so working_space is one level up at the repo root.
+      - ../working_space:/kaggle/code:rw
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
