@@ -49,7 +49,7 @@ class TestDataset(Dataset):
     def __getitem__(self, i):
         """Load and preprocess one seismic sample."""
         seis = np.load(self.files[i]).astype(np.float32)   # Shape: (5, 1000, 70).
-        seis = np.log1p(np.abs(seis))                     # Match the training transform.
+        seis = np.sign(seis) * np.log1p(np.abs(seis))     # sign·log1p: keep waveform polarity.
         return self.oids[i], torch.from_numpy(seis)
 
 

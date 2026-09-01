@@ -15,7 +15,9 @@ Kaggle competition. The model maps five-source seismic measurements to a
 ├── working_space/
 │   ├── config.py       # Shared paths, hyperparameters, and path resolution
 │   ├── data.py         # File pairing, lazy dataset, and sample indices
-│   ├── data_aug.py     # Data augmentation transforms (registry pattern)
+│   ├── data_aug.py     # Augmentation shim (re-exports pretrain)
+│   ├── pretrain.py     # Data augmentation transforms (registry pattern)
+│   ├── aug_config.py   # Augmentation config registry + winner write-back
 │   ├── model.py        # U-Net architecture
 │   ├── training.py     # Train/validate loops and parallelization helpers
 │   ├── utils.py        # Memory logging and artifact persistence
@@ -23,8 +25,11 @@ Kaggle competition. The model maps five-source seismic measurements to a
 │   ├── infer.py        # Test inference and submission generation
 │   ├── compute_stats.py# Velocity normalization statistics
 │   ├── test_unet.py    # U-Net shape/gradient smoke test
-│   └── smoke_test.py   # Data pairing and submission format test
-└── output/             # Training run artifacts
+│   ├── smoke_test.py   # Data pairing and submission format test
+│   ├── unet/           # Exploration notebooks + experiment writeups
+│   └── 1st_place_analysis.md
+├── output/             # Training run artifacts (model_*/best_unet.pth, submissions)
+└── kaggle_output/      # Kaggle-side scripts and artifacts
 ```
 
 ## Data Format
@@ -130,6 +135,94 @@ To add a new augmentation:
 > second dimension of the velocity model runs along the receiver (horizontal)
 > axis. If a visualization shows the horizontal axis is the first dimension,
 > change that line to `velocity[::-1, :]`.
+
+**Final augmentation conclusion**: after a full exploration sweep (15ep / 20ep
+/ 30% held-out / 60ep 2-Fold, all file-level), **no augmentation beats plain
+training**. The production config is `augmentations = {}`, frozen by writing
+`output/aug_explore/winner_aug.json`. `xflip` is the most harmful (the problem
+has no left-right symmetry — the 5 sources sit at fixed asymmetric positions),
+and xflip TTA is inapplicable because the model is not flip-equivariant.
+
+`aug_config.py` keeps the candidate registry (`AUG_CONFIGS`) and the
+`write_winner_aug()` / `clear_winner_aug()` helpers that toggle the override
+file consumed by `train.py`.
+
+## Experiments & Findings (UNet case close)
+
+All exploration uses a **file-level split + multi-fold** protocol (2-Fold CV,
+60 epochs) — sample-level K-Fold overstates gains due to within-file leakage.
+Full write-up: `working_space/unet/unet_experiment.md`.
+
+### Production configuration (finalized)
+
+| Item | Value |
+|---|---|
+| Model | U-Net base=32 (~24.3M params, `model.py`) |
+| Input features | **`sign(x)·log(1+|x|)`** (5-source, `(5,1000,70)`) — adopted after 14th-place A/B |
+| Augmentation | **none** (frozen via `winner_aug.json`) |
+| Training | 60 epochs, AdamW lr=1e-3, CosineAnnealingLR, batch 16, AMP fp16 |
+| Target norm | `(v - 2916.82) / 817.36` |
+| EMA | decay=0.999 on full-data formal training (EMA best 211.0) |
+
+### Best submission (3-model ensemble)
+
+`formal_1042 + cloud_0501 + formal_ema` → file-level holdout (5000 samples)
+**val MAE = 139.1** → `output/submission_ensformal_1042+cloud_0501+formal_ema.csv`
+(4,607,260 rows, validated).
+
+### Verified dead ends (protocol-confirmed)
+
+- **Augmentation** (xflip / time_shift / noise / amp / all): none best.
+- **xflip TTA**: inapplicable (no left-right symmetry).
+- **Gradient / envelope features**: no consistent gain.
+- **Hard-family data weighting**: invalid (+4.3 m/s).
+- **Regularization** (dropout / WD): dropout harmful, WD marginal.
+- **Larger base_channels** (48/64): unstable on small folds.
+- **Half-data EMA models in ensemble**: too weak.
+
+### Effective directions
+
+- **Multi-model ensemble**: 2 models -7.7, 3 models -6.0 (~4%).
+- **EMA on full-data training**: best single model (211.0).
+
+### ⚠️ Data scale caveat
+
+Local `train_samples/` is a **partial download (~1/47)**: ~10k samples per
+run vs. the competition's ~470k (test 65,818 matches). All experiments ran on
+this subset; full-data retraining is a large open lever.
+
+### Borrowed from the 14th-place writeup (Ruby) — verified ✅
+
+Low-cost A/B in `working_space/unet/improve_ruby.ipynb` (60ep × file-level
+2-Fold, baseline = none 271.2±2.0). **`sign·log1p` is the largest single win
+so far and is now the production preprocessing.**
+
+| Config | best_mae | vs none | note |
+|---|---|---|---|
+| **`sign(x)·log(1+\|x\|)`** | **250.0±1.9** | **-21.2 (7.8%)** | keep waveform polarity → **adopted** |
+| `sign_depth` (`sign·log1p` + depth L1) | 250.8±1.1 | -20.4 | depth adds nothing on 5ch sign |
+| `sign_cmp_depth` (10ch, + depth) | 253.0±2.0 | -18.2 | depth helps on 10ch (-6.9 vs sign_cmp) |
+| `sign_cmp` (10ch channel-split) | 259.9±1.2 | -11.3 | 10ch is worse than 5ch on sign |
+| `cmp_reorder` (raw 10ch channel-split) | 262.8±0.2 | -8.4 | see geometry note below |
+| Depth-weighted L1 (1 -> 1/4) | 265.7±0.2 | -5.5 | deeper rows are noisier |
+
+> **Conclusions**: channel-split (10ch) is **harmful on top of `sign·log1p`**
+> (+9.9 vs 5ch), and depth-weighting adds nothing on 5ch sign; the best
+> config is plain **`sign·log1p`** (5ch, no depth, no channel-split).
+>
+> **Geometry note**: source positions were verified from the data (first-arrival
+> V-shape) = receiver indices `[0,17,34,52,69]`, receivers uniform `[0..69]`.
+> Because `CMP = (src+recv)/2` is strictly monotonic per source, the CMP
+> permutation is the **identity** — Ruby's reorder degenerates to an
+> even/odd receiver channel-split (masked, keeps receiver dim 70).
+
+High-ROI but requires a forward simulator (not yet in repo):
+- **Reconstruction-error optimization** at inference `x -= λ·(F(M(x)) - x)` (~21%)
+- Forward-simulated self-training data (addresses the 1/47 data bottleneck)
+
+High-ROI but requires a forward simulator (not yet in repo):
+- **Reconstruction-error optimization** at inference `x -= λ·(F(M(x)) - x)` (~21%)
+- Forward-simulated self-training data (addresses the 1/47 data bottleneck)
 
 ## Local Usage
 
@@ -310,7 +403,11 @@ For each test object, the inference script writes 70 rows named
 
 - The training loss is L1 loss on normalized velocity maps. Training logs also
   report `val_mae_raw` in the original velocity units.
-- The seismic input is transformed with `log1p(abs(x))`.
+- The seismic input is transformed with `sign(x)·log(1+|x|)` (keeps waveform
+  polarity; adopted after the 14th-place A/B in `unet/improve_ruby.ipynb` —
+  -21 m/s vs `log1p(abs(x))` on file-level 2-Fold).
 - Training uses a file-level train/validation split to reduce leakage between
   samples from the same file.
+- **Data volume caveat**: the local `train_samples/` is a partial download
+  (~1/47 of the competition set), so experiments run on ~10k samples.
 - Reduce `batch_size` or `num_workers` if memory is limited.

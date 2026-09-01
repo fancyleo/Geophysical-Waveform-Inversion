@@ -34,3 +34,6 @@ working_space/aug_explore.ipynb
 
 # Preflight
 working_space/preflight.ipynb
+
+# Unet notebook
+working_space/unet/*

@@ -155,8 +155,11 @@ class SeisVelDataset(Dataset):
         velocity /= self.vel_std
 
         # Compress the seismic dynamic range with in-place ops to limit temporaries.
+        # sign·log1p keeps waveform polarity (adopted from 14th-place A/B, -21 m/s).
+        sign = np.sign(seismic)
         np.abs(seismic, out=seismic)
         np.log1p(seismic, out=seismic)
+        np.multiply(seismic, sign, out=seismic)
 
         seismic = seismic.reshape(Cfg.n_src, Cfg.n_steps, Cfg.n_recv)
         return torch.from_numpy(seismic), torch.from_numpy(velocity)

@@ -25,10 +25,15 @@ class DoubleConv(nn.Module):
 
 
 class UNet(nn.Module):
-    """Encode (B, 5, 1000, 70) seismic input into a (B, 70, 70) velocity map."""
+    """Encode (B, 5, 1000, 70) seismic input into a (B, 70, 70) velocity map.
 
-    def __init__(self, in_ch=Cfg.n_src, base=Cfg.model_base_channels):
+    ``dropout``: if > 0, apply ``Dropout2d`` on the bottleneck and each decoder
+    block output (regularization against overfitting). Default 0 = unchanged.
+    """
+
+    def __init__(self, in_ch=Cfg.n_src, base=Cfg.model_base_channels, dropout=0.0):
         super().__init__()
+        self.dropout = float(dropout)
         # Encoder: progressively reduce time and receiver dimensions.
         self.enc1 = DoubleConv(in_ch, base)      # 1000x70 -> 1000x70
         self.pool1 = nn.MaxPool2d(2, 2)          # -> 500x35
@@ -67,21 +72,33 @@ class UNet(nn.Module):
         e4 = self.enc4(self.pool3(e3))
         e4p = nn.functional.pad(e4, (0, 1))  # pad receiver dim 4 -> 5
         e5 = self.enc5(self.pool4(e4p))
+        if self.dropout > 0:
+            e5 = nn.functional.dropout2d(e5, self.dropout, training=self.training)
 
         u = self.up(e5)
         # Align decoder feature maps with their skip connections.
         u = nn.functional.interpolate(u, size=(125, 9), mode="nearest")
         d1 = self.dec1(torch.cat([u, e4], dim=1))
+        if self.dropout > 0:
+            d1 = nn.functional.dropout2d(d1, self.dropout, training=self.training)
         d2 = self.up2(d1)
         d2 = nn.functional.interpolate(d2, size=e3.shape[-2:], mode="bilinear", align_corners=False)
         d2 = self.dec2(torch.cat([d2, e3], dim=1))
+        if self.dropout > 0:
+            d2 = nn.functional.dropout2d(d2, self.dropout, training=self.training)
         d3 = self.up3(d2)
         d3 = nn.functional.interpolate(d3, size=e2p.shape[-2:], mode="bilinear", align_corners=False)
         d3 = self.dec3(torch.cat([d3, e2p], dim=1))
+        if self.dropout > 0:
+            d3 = nn.functional.dropout2d(d3, self.dropout, training=self.training)
         d4 = self.up4(d3)
         d4 = nn.functional.interpolate(d4, size=e1.shape[-2:], mode="bilinear", align_corners=False)
         d4 = self.dec4(torch.cat([d4, e1], dim=1))
+        if self.dropout > 0:
+            d4 = nn.functional.dropout2d(d4, self.dropout, training=self.training)
         d5 = nn.functional.interpolate(d4, size=(Cfg.img_size, Cfg.img_size),
                                        mode="bilinear", align_corners=False)
         d5 = self.dec5(d5)
+        if self.dropout > 0:
+            d5 = nn.functional.dropout2d(d5, self.dropout, training=self.training)
         return self.head(d5).squeeze(1)  # (B, 70, 70)
