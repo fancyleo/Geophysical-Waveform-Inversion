@@ -23,6 +23,7 @@ Kaggle competition. The model maps five-source seismic measurements to a
 │   ├── utils.py        # Memory logging and artifact persistence
 │   ├── train.py        # Training entry point
 │   ├── infer.py        # Test inference and submission generation
+│   ├── forward_model.py# Forward modeling: velocity -> seismic (2D acoustic FDTD)
 │   ├── compute_stats.py# Velocity normalization statistics
 │   ├── test_unet.py    # U-Net shape/gradient smoke test
 │   ├── smoke_test.py   # Data pairing and submission format test
@@ -216,11 +217,10 @@ so far and is now the production preprocessing.**
 > permutation is the **identity** — Ruby's reorder degenerates to an
 > even/odd receiver channel-split (masked, keeps receiver dim 70).
 
-High-ROI but requires a forward simulator (not yet in repo):
-- **Reconstruction-error optimization** at inference `x -= λ·(F(M(x)) - x)` (~21%)
-- Forward-simulated self-training data (addresses the 1/47 data bottleneck)
-
-High-ROI but requires a forward simulator (not yet in repo):
+High-ROI, powered by the **forward simulator** (now in repo):
+- `working_space/forward_model.py` — 2D acoustic FDTD (24th-order space, 2nd-order
+  time + ABC), ported from jaewook704's `vel-to-seis` notebook. `vel_to_seis(vel)
+  -> (5,1000,70)`. **Validated**: corr 0.995 vs real FlatVel_A gather, ~3.3 s/sample.
 - **Reconstruction-error optimization** at inference `x -= λ·(F(M(x)) - x)` (~21%)
 - Forward-simulated self-training data (addresses the 1/47 data bottleneck)
 
