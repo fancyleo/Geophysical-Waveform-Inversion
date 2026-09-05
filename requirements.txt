@@ -1,0 +1,13 @@
+# Core runtime deps (concise, from actual imports across the project)
+numpy>=2.5.2
+torch>=2.5.1
+scikit-learn>=1.9.0
+matplotlib>=3.11.1
+pandas>=3.0.5
+tqdm>=4.70.0
+
+# Notebooks (.ipynb under working_space/unet/, etc.)
+jupyter>=1.1.1
+
+# Optional: memory diagnostics in working_space/utils.py (guarded try/except)
+# psutil>=5.9.0
