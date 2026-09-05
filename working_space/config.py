@@ -4,12 +4,26 @@ import os
 from pathlib import Path
 
 
+def _safe_is_dir(path):
+    """Like Path.is_dir() but tolerant of unreadable symlink targets.
+
+    path.is_dir() follows symlinks and raises PermissionError when an
+    intermediate directory (e.g. /root owned by root) cannot be traversed.
+    Treat that as "not a usable directory" so dataset discovery degrades
+    gracefully instead of crashing.
+    """
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _is_waveform_root(path):
     """Return whether a directory contains the expected waveform layout."""
     return (
-        path.is_dir()
-        and (path / "train_samples").is_dir()
-        and (path / "test").is_dir()
+        _safe_is_dir(path)
+        and _safe_is_dir(path / "train_samples")
+        and _safe_is_dir(path / "test")
     )
 
 
@@ -26,15 +40,25 @@ def resolve_data_root():
 
     # Kaggle mounts the dataset under a nested layout, e.g.
     #   /kaggle/input/waveform-inversion
-    #   /kaggle/input/competitions/waveform-inversion
+    #   /kaggle/input/competitions/waveform-inversion   (Kaggle)
+    #   /kaggle/input/competition/waveform-inversion    (cloud-container mirror
+    #                                                    layout; e.g. autodl: a
+    #                                                    symlink to the data disk)
     #   /kaggle/competition/waveform-inversion
     for base in (Path("/kaggle/input"), Path("/kaggle/competition")):
-        if not base.is_dir():
+        if not _safe_is_dir(base):
             continue
-        candidates.extend(path for path in base.iterdir() if path.is_dir())
-        competitions = base / "competitions"
-        if competitions.is_dir():
-            candidates.extend(path for path in competitions.iterdir() if path.is_dir())
+        candidates.extend(path for path in base.iterdir() if _safe_is_dir(path))
+        # Accept both "competitions" (plural, Kaggle) and "competition"
+        # (singular, some cloud containers) nesting. _safe_is_dir follows
+        # symlinks, so once the target is readable the dataset is discovered
+        # automatically -- no copy or re-mount needed.
+        for nested_name in ("competitions", "competition"):
+            nested = base / nested_name
+            if _safe_is_dir(nested):
+                candidates.extend(
+                    path for path in nested.iterdir() if _safe_is_dir(path)
+                )
 
     for candidate in candidates:
         if _is_waveform_root(candidate):
@@ -125,7 +149,7 @@ def _load_augmentations(path, default):
             if isinstance(data, dict) and isinstance(data.get("augmentations"), dict):
                 return data["augmentations"]
     except Exception as exc:  # defensive: never break training on a bad override
-        print(f"[warn] 读取增强覆盖文件失败({exc})，使用默认增强")
+        print(f"[warn] failed to read augmentation override ({exc}); using default augmentations")
     return default
 
 
@@ -170,8 +194,9 @@ class Cfg:
     # the matching function in pretrain.py; "prob" is the apply probability.
     # Set prob to 0 or remove a key to disable that augmentation. To add a new
     # one, write it in pretrain.py with @register_aug("name") and enable here.
-    # NOTE: 若 output/aug_explore/winner_aug.json 存在，将自动覆盖以下默认值
-    #（由 aug_config.write_winner_aug 写回，供 train.py / preflight.ipynb 直接使用）。
+    # NOTE: if output/aug_explore/winner_aug.json exists, it overrides these
+    # defaults (written back by aug_config.write_winner_aug so that train.py /
+    # preflight.ipynb can directly use the winning augmentation).
     _aug_override_path = project_root / "output" / "aug_explore" / "winner_aug.json"
     augmentations = _load_augmentations(_aug_override_path, {
         "xflip": {"prob": 0.5},

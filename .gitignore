@@ -37,3 +37,12 @@ working_space/preflight.ipynb
 
 # Unet notebook
 working_space/unet/*
+
+# Training log
+*.log
+
+# mds
+working_space/*.md
+
+# notebooks
+working_space/*.ipynb

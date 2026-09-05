@@ -18,6 +18,7 @@ import argparse
 import gc
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +60,44 @@ os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")   # trim heap when >=1
 os.environ.setdefault("MALLOC_MMAP_THRESHOLD_", "131072")   # large allocs via mmap -> returned on free
 os.environ.setdefault("MALLOC_TOP_PAD_", "65536")           # keep ~64KB headroom after a trim
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")              # cap arenas so freed memory coalesces
+
+# ---------------------------------------------------------------------------
+# Project-root progress log
+#
+# Appends the current training/project progress (startup context, per-epoch
+# metrics, best model, final summary) as timestamped lines to
+# training_progress.log under the project root so it can be inspected anytime
+# with tail. Console output is unchanged (each line is also echoed to stdout).
+# Only the main process (rank 0) writes to the file; DDP workers do not.
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROGRESS_LOG_PATH = PROJECT_ROOT / "training_progress.log"
+
+
+def _log_timestamp():
+    """Return the current local time as a log-friendly string."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class ProgressLogger:
+    """Append timestamped progress lines to the project-root log file.
+
+    Every line is written as ``[<time>] <message>`` to ``PROGRESS_LOG_PATH``
+    (created if missing). When ``echo`` is True (default) the message is also
+    printed to the console, so existing console progress output is preserved.
+    """
+
+    def __init__(self, path=PROGRESS_LOG_PATH):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, message, echo=True):
+        """Append one progress line to the log file and optionally echo it."""
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(f"[{_log_timestamp()}] {message}\n")
+        if echo:
+            print(message)
+
 
 # ---------------------------------------------------------------------------
 # Command-line entry point
@@ -163,6 +202,17 @@ def train_worker(local_rank, world_size, args):
     run_dir = create_run_dir(args.out_dir, prefix=run_prefix) if is_main_process() else None
     run_started_at = time.perf_counter()
 
+    # Project-root progress log: only the main process creates it and writes a
+    # one-line startup context.
+    progress = ProgressLogger() if is_main_process() else None
+    if progress is not None:
+        progress.write(
+            f"[start] run_dir={run_dir}  device={device}  families="
+            f"{', '.join(selected_families)}  epochs={args.epochs}  "
+            f"batch_size={args.batch_size}  parallel_mode={args.parallel_mode}",
+            echo=False,
+        )
+
     torch.manual_seed(Cfg.seed)
     np.random.seed(Cfg.seed)
 
@@ -187,7 +237,7 @@ def train_worker(local_rank, world_size, args):
     del indices, tr_set, va_set
     gc.collect()
     if is_main_process():
-        print(f"[info] train samples: {len(tr_idx)}, val samples: {len(va_idx)}")
+        progress.write(f"[info] train samples: {len(tr_idx)}, val samples: {len(va_idx)}")
 
     train_ds = SeisVelDataset(
         pairs, tr_idx, vel_mean=vel_mean, vel_std=vel_std,
@@ -225,7 +275,7 @@ def train_worker(local_rank, world_size, args):
     )
     n_params = sum(p.numel() for p in model.parameters())
     if is_main_process():
-        print(f"[info] model params: {n_params/1e6:.2f}M")
+        progress.write(f"[info] model params: {n_params/1e6:.2f}M")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=Cfg.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -260,7 +310,7 @@ def train_worker(local_rank, world_size, args):
             "val_mae_raw": val_mae_raw,
         })
         if is_main_process():
-            print(
+            progress.write(
                 f"epoch {epoch:03d}  "
                 f"train_mae_norm={tr_loss:.4f}  "
                 f"val_mae_norm={va_loss:.4f}  "
@@ -274,7 +324,7 @@ def train_worker(local_rank, world_size, args):
                 torch.save(state, run_dir / "best_unet.pth")
                 del state
                 gc.collect()
-                print(f"  saved best (val_mae_raw={val_mae_raw:.2f})")
+                progress.write(f"  saved best (val_mae_raw={val_mae_raw:.2f})")
 
     if not is_main_process():
         cleanup_ddp()
@@ -327,8 +377,14 @@ def train_worker(local_rank, world_size, args):
         "elapsed_seconds": elapsed_seconds,
         "memory_monitoring": memory_series,
     })
-    print(f"[done] best val_mae_raw = {best_val * vel_std:.2f}")
-    print(f"[done] run artifacts saved to {run_dir}")
+    if progress is not None:
+        progress.write(
+            f"[done] best epoch={best_epoch}  "
+            f"best val_mae_raw={best_val * vel_std:.2f}  "
+            f"elapsed={elapsed_seconds:.1f}s"
+        )
+        progress.write(f"[done] run artifacts saved to {run_dir}")
+        progress.write("==================== Training finished ====================", echo=False)
     cleanup_ddp()
 
 
