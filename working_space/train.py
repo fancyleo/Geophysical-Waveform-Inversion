@@ -15,7 +15,9 @@ Submission format: one row per oid/y position with odd x-columns only.
 """
 
 import argparse
+import copy
 import gc
+import math
 import os
 import time
 from datetime import datetime
@@ -23,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader, DistributedSampler
@@ -99,6 +102,27 @@ class ProgressLogger:
             print(message)
 
 
+def _load_resume_state(path, device):
+    """Load a model state_dict from a checkpoint, normalizing common formats.
+
+    Accepts a bare state_dict (as saved by this repo's ``best_unet.pth``) or a
+    dict that wraps it under ``model`` / ``model_state_dict`` / ``state_dict``.
+    Keys prefixed with ``module.`` (DataParallel) are stripped so the state
+    matches a bare ``UNet``.
+    """
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    if isinstance(checkpoint, dict):
+        for key in ("model_state_dict", "state_dict", "model"):
+            if key in checkpoint and isinstance(checkpoint[key], dict):
+                checkpoint = checkpoint[key]
+                break
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Unsupported checkpoint format: {path}")
+    if any(key.startswith("module.") for key in checkpoint):
+        checkpoint = {key[len("module."):]: value for key, value in checkpoint.items()}
+    return checkpoint
+
+
 # ---------------------------------------------------------------------------
 # Command-line entry point
 # ---------------------------------------------------------------------------
@@ -146,6 +170,56 @@ def main():
         type=int,
         default=1,
         help="Number of processes to spawn for DDP (multi-GPU).",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to a state_dict checkpoint (e.g. a previous run's "
+             "best_unet.pth) used to initialize weights and continue training.",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=Cfg.lr,
+        help="Peak learning rate; lower it (e.g. 1e-4) when resuming/fine-tuning "
+             "an already-trained model.",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=Cfg.weight_decay,
+        help="AdamW L2 weight decay for regularization.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=Cfg.dropout,
+        help="UNet bottleneck/decoder Dropout2d rate (0 disables dropout).",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=Cfg.early_stop_patience,
+        help="Early stop after this many epochs without validation improvement "
+             "(0 disables early stopping).",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable AMP (fp16 autocast + GradScaler) for training steps.",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.0,
+        help="EMA decay for weight averaging (0 disables EMA; e.g. 0.999).",
+    )
+    parser.add_argument(
+        "--schedule",
+        choices=("cosine", "ruby"),
+        default="ruby",
+        help="LR schedule: cosine anneals over all epochs; ruby keeps peak LR for "
+             "the first 80% of epochs then cosine-decays over the final 20%.",
     )
     args = parser.parse_args()
 
@@ -268,8 +342,14 @@ def train_worker(local_rank, world_size, args):
         val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
                                   num_workers=args.num_workers, pin_memory=use_pin_memory)
 
-    # Build the model, optimizer, scheduler, and loss function.
-    model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(device)
+    # Build the model; optionally initialize weights from a previous run.
+    model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels,
+                 dropout=args.dropout).to(device)
+    if args.resume:
+        state_dict = _load_resume_state(args.resume, device)
+        model.load_state_dict(state_dict)
+        if progress is not None:
+            progress.write(f"[info] resumed weights from {args.resume}")
     model, resolved_parallel_mode = wrap_model_for_parallel(
         model, args.parallel_mode, device, world_size
     )
@@ -277,19 +357,72 @@ def train_worker(local_rank, world_size, args):
     if is_main_process():
         progress.write(f"[info] model params: {n_params/1e6:.2f}M")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=Cfg.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # A lower peak LR is recommended when resuming an already-trained model.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay)
+    if args.schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs
+        )
+    else:
+        # Ruby-style schedule: constant peak LR for the first 80% of epochs,
+        # then cosine decay over the final 20%.
+        const_epochs = max(1, int(round(0.8 * args.epochs)))
+        cos_epochs = max(1, args.epochs - const_epochs)
+
+        def _ruby_lr_lambda(epoch_idx):  # 0-based epoch index
+            if epoch_idx < const_epochs:
+                return 1.0
+            t = (epoch_idx - const_epochs) / cos_epochs
+            return 0.5 * (1.0 + math.cos(math.pi * t))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=_ruby_lr_lambda
+        )
     criterion = nn.L1Loss()  # MAE in normalized target units.
+
+    # Mixed precision (AMP) + optional EMA weight averaging.
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
+    ema_state = None
+    ema_model = None
+    ema_best_val = float("inf")
+    ema_best_epoch = None
+    ema_history = []
+    if args.ema_decay and args.ema_decay > 0 and not distributed:
+        base_model = unwrap_model(model)
+        ema_state = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
+        ema_model = copy.deepcopy(base_model)
+        ema_model.eval()
+        if progress is not None:
+            progress.write(
+                f"[info] EMA enabled (decay={args.ema_decay}) "
+                f"with {len(ema_state)} state tensors"
+            )
+
+    def _ema_update():
+        """Refresh EMA copies of every floating tensor in the model state."""
+        if ema_state is None:
+            return
+        with torch.no_grad():
+            decay = args.ema_decay
+            for name, value in unwrap_model(model).state_dict().items():
+                if name in ema_state and value.is_floating_point():
+                    ema_state[name].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
 
     best_val = float("inf")
     best_epoch = None
+    no_improve_epochs = 0
     history = []
     memory_series = []
     rss_baseline = current_rss_mb()
     for epoch in range(1, args.epochs + 1):
         if distributed and hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
-        tr_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        tr_loss = train_one_epoch(
+            model, train_loader, optimizer, criterion, device,
+            use_amp=args.amp, scaler=scaler,
+            ema_update=(_ema_update if ema_state is not None else None),
+        )
         va_loss = validate(model, val_loader, criterion, device)
         scheduler.step()
         if is_main_process():
@@ -319,12 +452,48 @@ def train_worker(local_rank, world_size, args):
         if va_loss < best_val:
             best_val = va_loss
             best_epoch = epoch
+            no_improve_epochs = 0
             if is_main_process():
                 state = unwrap_model(model).state_dict()
                 torch.save(state, run_dir / "best_unet.pth")
                 del state
                 gc.collect()
                 progress.write(f"  saved best (val_mae_raw={val_mae_raw:.2f})")
+        elif args.patience > 0:
+            no_improve_epochs += 1
+
+        if ema_state is not None:
+            with torch.no_grad():
+                ema_model.load_state_dict(ema_state)
+            ema_va_norm = validate(ema_model, val_loader, criterion, device)
+            ema_va_raw = ema_va_norm * vel_std
+            ema_history.append({"epoch": epoch, "val_mae_raw": ema_va_raw})
+            if is_main_process():
+                progress.write(f"ema  epoch {epoch:03d}  val_mae_raw={ema_va_raw:.2f}")
+            if ema_va_raw < ema_best_val:
+                ema_best_val = ema_va_raw
+                ema_best_epoch = epoch
+                if is_main_process():
+                    torch.save(
+                        {k: v.detach().cpu().clone() for k, v in ema_state.items()},
+                        run_dir / "best_ema.pth",
+                    )
+                    progress.write(f"  saved best EMA (val_mae_raw={ema_va_raw:.2f})")
+
+        # Early stopping: stop once val has not improved for `patience` epochs.
+        stop_now = args.patience > 0 and no_improve_epochs >= args.patience
+        if distributed:
+            # Unanimous rank-0 decision so every DDP rank breaks together.
+            flag = torch.tensor([1.0 if stop_now else 0.0], device=device)
+            dist.broadcast(flag, src=0)
+            stop_now = bool(flag[0].item() > 0.5)
+        if stop_now:
+            if is_main_process():
+                progress.write(
+                    f"[info] early stopping at epoch {epoch:03d} "
+                    f"(no val improvement for {no_improve_epochs} epochs)"
+                )
+            break
 
     if not is_main_process():
         cleanup_ddp()
@@ -354,6 +523,13 @@ def train_worker(local_rank, world_size, args):
     })
     save_json(run_dir / "results.json", {
         "run_dir": str(run_dir),
+        "resumed_from": args.resume,
+        "peak_lr": args.lr,
+        "amp": bool(args.amp),
+        "schedule": args.schedule,
+        "ema_decay": args.ema_decay,
+        "ema_best_epoch": ema_best_epoch,
+        "ema_best_val_mae_raw": (ema_best_val if ema_best_val < float("inf") else None),
         "device": str(device),
         "parallel_mode_requested": args.parallel_mode,
         "parallel_mode_resolved": resolved_parallel_mode,
@@ -376,6 +552,7 @@ def train_worker(local_rank, world_size, args):
         "velocity_stats_path": stats_path,
         "elapsed_seconds": elapsed_seconds,
         "memory_monitoring": memory_series,
+        "ema_history": ema_history,
     })
     if progress is not None:
         progress.write(

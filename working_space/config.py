@@ -189,8 +189,16 @@ class Cfg:
     val_ratio = 0.1
     model_base_channels = 32
 
-    # Data augmentation (train only; applied to raw physical traces before
-    # abs/log1p and velocity normalization). Each key maps to params passed to
+    # Per working_space/unet conclusions: the model is capacity/data-limited, not
+    # overfitting-dominated, so keep AdamW's default L2 (1e-2) and no dropout.
+    # These stay configurable via train.py --weight_decay / --dropout.
+    weight_decay = 1e-2          # AdamW L2 weight decay (torch default)
+    dropout = 0.0                # UNet bottleneck/decoder Dropout2d rate (0 = disabled)
+    early_stop_patience = 6      # stop after N epochs without val improvement (0 disables)
+
+    # Data augmentation (train only; applied to raw physical traces before the
+    # sign*log1p preprocessing and velocity normalization). Each key maps to params
+    # passed to
     # the matching function in pretrain.py; "prob" is the apply probability.
     # Set prob to 0 or remove a key to disable that augmentation. To add a new
     # one, write it in pretrain.py with @register_aug("name") and enable here.
@@ -198,10 +206,10 @@ class Cfg:
     # defaults (written back by aug_config.write_winner_aug so that train.py /
     # preflight.ipynb can directly use the winning augmentation).
     _aug_override_path = project_root / "output" / "aug_explore" / "winner_aug.json"
-    augmentations = _load_augmentations(_aug_override_path, {
-        "xflip": {"prob": 0.5},
-        "time_shift": {"prob": 0.5, "max_shift": 100},
-    })
+    # No augmentation -- working_space/unet experiments (15ep/20ep/30% holdout/60ep
+    # 2-Fold) consistently found plain training best; xflip is physically invalid
+    # for this problem and the most harmful. See working_space/unet/*.md.
+    augmentations = _load_augmentations(_aug_override_path, {})
 
     # Target normalization; values computed for all 10 families via compute_stats.py.
     # train.py prefers the stats JSON in output/stats/ when it exists.

@@ -80,26 +80,41 @@ def unwrap_model(model):
     return model
 
 
-def _run_epoch(model, loader, criterion, device, optimizer=None):
-    """Run one epoch; optimize when ``optimizer`` is given, otherwise validate."""
+def _run_epoch(model, loader, criterion, device, optimizer=None,
+               use_amp=False, scaler=None, ema_update=None):
+    """Run one epoch; optimize when ``optimizer`` is given, otherwise validate.
+
+    ``use_amp``/``scaler`` enable mixed-precision training steps; ``ema_update``
+    (if given) is invoked after every optimizer step to refresh EMA weights.
+    """
     if optimizer is not None:
         model.train()
     else:
         model.eval()
 
+    device_type = getattr(device, "type", str(device))
+    autocast = torch.autocast(device_type=device_type, enabled=bool(use_amp))
     total, count = 0.0, 0
     progress = tqdm(loader, desc="train" if optimizer else "valid", leave=False)
     for seismic, velocity in progress:
         seismic, velocity = seismic.to(device), velocity.to(device)
         velocity = velocity.squeeze(1) if velocity.dim() == 4 else velocity
 
-        prediction = model(seismic)
-        loss = criterion(prediction, velocity)
+        with autocast:
+            prediction = model(seismic)
+            loss = criterion(prediction, velocity)
 
         if optimizer is not None:
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if use_amp and scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+            if ema_update is not None:
+                ema_update()
 
         batch_size = seismic.size(0)
         total += loss.item() * batch_size
@@ -111,9 +126,11 @@ def _run_epoch(model, loader, criterion, device, optimizer=None):
     return total / max(count, 1)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, device,
+                    use_amp=False, scaler=None, ema_update=None):
     """Run one training epoch and return the sample-weighted mean loss."""
-    return _run_epoch(model, loader, criterion, device, optimizer=optimizer)
+    return _run_epoch(model, loader, criterion, device, optimizer=optimizer,
+                      use_amp=use_amp, scaler=scaler, ema_update=ema_update)
 
 
 @torch.no_grad()
