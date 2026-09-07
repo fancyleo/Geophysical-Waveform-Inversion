@@ -219,7 +219,15 @@ def main():
         choices=("cosine", "ruby"),
         default="ruby",
         help="LR schedule: cosine anneals over all epochs; ruby keeps peak LR for "
-             "the first 80% of epochs then cosine-decays over the final 20%.",
+             "the first 80 percent of epochs, then cosine-decays over the final "
+             "20 percent.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=Cfg.seed,
+        help="Random seed for model init, file-level split, and shuffling; use a "
+             "different value per run to grow a multi-seed ensemble pool.",
     )
     args = parser.parse_args()
 
@@ -283,12 +291,13 @@ def train_worker(local_rank, world_size, args):
         progress.write(
             f"[start] run_dir={run_dir}  device={device}  families="
             f"{', '.join(selected_families)}  epochs={args.epochs}  "
-            f"batch_size={args.batch_size}  parallel_mode={args.parallel_mode}",
+            f"batch_size={args.batch_size}  seed={args.seed}  "
+            f"parallel_mode={args.parallel_mode}",
             echo=False,
         )
 
-    torch.manual_seed(Cfg.seed)
-    np.random.seed(Cfg.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     # Collect paired training files and build a file-level split.
     if is_main_process():
@@ -303,7 +312,7 @@ def train_worker(local_rank, world_size, args):
     if len(file_ids) < 2:
         raise ValueError("At least two data files are required for a train/validation split")
     tr_files, va_files = train_test_split(
-        file_ids, test_size=Cfg.val_ratio, random_state=Cfg.seed
+        file_ids, test_size=Cfg.val_ratio, random_state=args.seed
     )
     tr_set = set(tr_files); va_set = set(va_files)
     tr_idx = [idx for idx in indices if idx[0] in tr_set]
@@ -315,7 +324,7 @@ def train_worker(local_rank, world_size, args):
 
     train_ds = SeisVelDataset(
         pairs, tr_idx, vel_mean=vel_mean, vel_std=vel_std,
-        augmentations=Cfg.augmentations, train=True, seed=Cfg.seed,
+        augmentations=Cfg.augmentations, train=True, seed=args.seed,
     )
     val_ds = SeisVelDataset(pairs, va_idx, vel_mean=vel_mean, vel_std=vel_std,
                             train=False)
@@ -525,6 +534,7 @@ def train_worker(local_rank, world_size, args):
         "run_dir": str(run_dir),
         "resumed_from": args.resume,
         "peak_lr": args.lr,
+        "seed": args.seed,
         "amp": bool(args.amp),
         "schedule": args.schedule,
         "ema_decay": args.ema_decay,
