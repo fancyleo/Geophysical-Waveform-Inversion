@@ -229,6 +229,14 @@ def main():
         help="Random seed for model init, file-level split, and shuffling; use a "
              "different value per run to grow a multi-seed ensemble pool.",
     )
+    parser.add_argument(
+        "--split_seed",
+        type=int,
+        default=Cfg.val_split_seed,
+        help="Seed for the file-level train/val split. Keep the same value across "
+             "seeds so every run shares one fixed holdout (comparable val + fair "
+             "ensemble eval).",
+    )
     args = parser.parse_args()
 
     if args.test_run:
@@ -292,6 +300,7 @@ def train_worker(local_rank, world_size, args):
             f"[start] run_dir={run_dir}  device={device}  families="
             f"{', '.join(selected_families)}  epochs={args.epochs}  "
             f"batch_size={args.batch_size}  seed={args.seed}  "
+            f"split_seed={args.split_seed}  "
             f"parallel_mode={args.parallel_mode}",
             echo=False,
         )
@@ -312,7 +321,7 @@ def train_worker(local_rank, world_size, args):
     if len(file_ids) < 2:
         raise ValueError("At least two data files are required for a train/validation split")
     tr_files, va_files = train_test_split(
-        file_ids, test_size=Cfg.val_ratio, random_state=args.seed
+        file_ids, test_size=Cfg.val_ratio, random_state=args.split_seed
     )
     tr_set = set(tr_files); va_set = set(va_files)
     tr_idx = [idx for idx in indices if idx[0] in tr_set]
@@ -535,6 +544,7 @@ def train_worker(local_rank, world_size, args):
         "resumed_from": args.resume,
         "peak_lr": args.lr,
         "seed": args.seed,
+        "split_seed": args.split_seed,
         "amp": bool(args.amp),
         "schedule": args.schedule,
         "ema_decay": args.ema_decay,

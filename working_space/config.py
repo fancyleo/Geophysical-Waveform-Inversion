@@ -170,6 +170,10 @@ class Cfg:
 
     # Reproducibility and runtime
     seed = 42
+    # Fixed file-level split seed used to build a SHARED val/holdout for every
+    # training run, so per-run val numbers and ensemble evaluation are directly
+    # comparable. Independent of --seed (which varies init/shuffle for diversity).
+    val_split_seed = 777
     device = "auto"                 # auto, cpu, or cuda
     # single is stable and leak-free on host memory; data_parallel uses all
     # GPUs but can grow host RSS on multi-GPU T4 via scatter/gather buffers.
