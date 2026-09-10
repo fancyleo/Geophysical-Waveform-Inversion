@@ -168,8 +168,11 @@ def main():
         for path in preds:
             if path in chosen:
                 continue
-            trial_mae = raw_mae(torch.stack([ensemble_pred(chosen), preds[path]],
-                                            dim=0).mean(dim=0))
+            if chosen:
+                trial = torch.stack([ensemble_pred(chosen), preds[path]], dim=0).mean(dim=0)
+            else:
+                trial = preds[path]
+            trial_mae = raw_mae(trial)
             if trial_mae < best_gain[0]:
                 best_gain = (trial_mae, path)
         if best_gain[1] is None or best_gain[0] >= current_mae:
