@@ -149,11 +149,15 @@ def main():
     def raw_mae(tensor):
         return (tensor - targets).abs().mean().item() * vel_std
 
+    def label(path):
+        p = Path(path)
+        return f"{p.parent.name}/{p.name}" if p.is_file() else f"{p.name}"
+
     print("\n=== Single-model holdout MAE (m/s) ===")
     single = {}
     for path, pred in preds.items():
         single[path] = raw_mae(pred)
-        print(f"  {Path(path).parent.name if not Path(path).is_file() else path}: {single[path]:.2f}")
+        print(f"  {label(path):<38s} {single[path]:.2f}")
 
     def ensemble_pred(keys):
         return torch.stack([preds[k] for k in keys], dim=0).mean(dim=0)
@@ -175,11 +179,11 @@ def main():
         if best_gain[1] is None or best_gain[0] >= current_mae:
             break  # no model improves the current ensemble
         chosen.append(best_gain[1])
-        name = Path(best_gain[1]).parent.name
-        print(f"  + {name:<22s} ensemble MAE = {best_gain[0]:.2f}  (n={len(chosen)})")
+        print(f"  + {label(best_gain[1]):<38s} ensemble MAE = "
+              f"{best_gain[0]:.2f}  (n={len(chosen)})")
 
     if chosen:
-        final_name = " + ".join(Path(p).parent.name for p in chosen)
+        final_name = " + ".join(label(p) for p in chosen)
         print(f"\nBest ensemble ({len(chosen)} models): {final_name}")
         print(f"  holdout MAE = {raw_mae(ensemble_pred(chosen)):.2f} m/s")
     else:
