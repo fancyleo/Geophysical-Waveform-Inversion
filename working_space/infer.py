@@ -7,6 +7,13 @@ Usage (local default paths):
 
 For Kaggle, override the default paths with --ckpt, --test_dir, and --out.
 
+Equal-weight multi-checkpoint ensemble (the repo's validated best recipe --
+121.10 m/s single vs 111.49 m/s with 6 checkpoints on the shared holdout):
+    python infer.py --ckpt run_a/best_ema.pth run_a/best_unet.pth \
+                           run_b/best_ema.pth run_b/best_unet.pth \
+                           run_c/best_ema.pth run_c/best_unet.pth \
+                    --test_dir D:/data/test --out submission.csv
+
 Output format (matching sample_submission.csv):
   oid_ypos,x_1,x_3,...,x_69
   000039dca2_y_0,3000.0,3000.0,...,3000.0
@@ -54,22 +61,58 @@ class TestDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint loading
+# ---------------------------------------------------------------------------
+def load_state(path, device):
+    """Load a state_dict, normalizing the wrapper formats train.py may save."""
+    state = torch.load(path, map_location=device, weights_only=True)
+    if isinstance(state, dict):
+        for key in ("model_state_dict", "state_dict", "model"):
+            if key in state and isinstance(state[key], dict):
+                state = state[key]
+                break
+    if isinstance(state, dict) and any(k.startswith("module.") for k in state):
+        state = {k[len("module."):]: v for k, v in state.items()}
+    return state
+
+
+def ensemble_predict(batch, models):
+    """Equal-weight average of every model's prediction for one batch."""
+    if len(models) == 1:
+        return models[0](batch)
+    total = models[0](batch).float()
+    for model in models[1:]:
+        total = total + model(batch).float()
+    return total / len(models)
+
+
+# ---------------------------------------------------------------------------
 # Inference entry point
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def main():
     """Run inference and write predictions in Kaggle submission format."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt",     default=str(Cfg.checkpoint_path))
+    parser.add_argument(
+        "--ckpt", nargs="+", default=[str(Cfg.checkpoint_path)],
+        help="One or more checkpoint files. Multiple checkpoints are averaged "
+             "with equal weight (validated best recipe: 6 checkpoints).",
+    )
     parser.add_argument("--test_dir", default=str(Cfg.test_data_dir))
     parser.add_argument("--out",      default=str(Cfg.submission_path))
     parser.add_argument("--batch_size", type=int, default=Cfg.infer_batch_size)
     parser.add_argument("--vel_mean", type=float, default=Cfg.vel_mean)
     parser.add_argument("--vel_std",  type=float, default=Cfg.vel_std)
+    parser.add_argument("--device", default=Cfg.device,
+                        choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--num_workers", type=int, default=Cfg.num_workers,
+                        help="DataLoader workers; use 0 on Windows if it errors.")
     parser.add_argument(
         "--stats_path",
         default=None,
-        help="Optional velocity-statistics JSON path; defaults to the checkpoint directory.",
+        help="Optional velocity-statistics JSON path; defaults to the directory "
+             "of the first checkpoint (velocity_stats.json is stored there by "
+             "train.py).",
     )
     args = parser.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -77,25 +120,32 @@ def main():
     stats_path = (
         Path(args.stats_path)
         if args.stats_path
-        else Path(args.ckpt).resolve().parent / "velocity_stats.json"
+        else Path(args.ckpt[0]).resolve().parent / "velocity_stats.json"
     )
     if stats_path.is_file():
         args.vel_mean, args.vel_std = load_velocity_stats(stats_path)
         print(f"[info] loaded velocity statistics: {stats_path}")
+    else:
+        print(f"[warn] no statistics JSON at {stats_path}; using --vel_mean/--vel_std "
+              f"({args.vel_mean:.2f}/{args.vel_std:.2f})")
 
-    device = resolve_device()
+    device = resolve_device(args.device)
+    print(f"[info] device: {device}")
 
-    # Load the trained model.
-    model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(device)
-    state = torch.load(args.ckpt, map_location=device)
-    model.load_state_dict(state)
-    model.eval()
-    print(f"[info] loaded checkpoint: {args.ckpt}")
+    # Load one or more trained models (equal-weight ensemble when several).
+    models = []
+    for ckpt in args.ckpt:
+        model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(device)
+        model.load_state_dict(load_state(ckpt, device))
+        model.eval()
+        models.append(model)
+        print(f"[info] loaded checkpoint: {ckpt}")
+    print(f"[info] ensemble size: {len(models)} (equal-weight average)")
 
     # Prepare the test data loader.
     ds = TestDataset(args.test_dir)
     loader = DataLoader(
-        ds, batch_size=args.batch_size, shuffle=False, num_workers=Cfg.num_workers
+        ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
     )
 
     # Generate velocity predictions.
@@ -103,7 +153,7 @@ def main():
     preds = []   # Store denormalized predictions with shape (B, 70, 70).
     for oids, seis in tqdm(loader, desc="inference"):
         seis = seis.to(device)                     # (B,5,1000,70)
-        pred = model(seis)                         # (B,70,70)
+        pred = ensemble_predict(seis, models)      # (B,70,70) normalized
         pred = pred.cpu().numpy() * args.vel_std + args.vel_mean
         preds.append(pred)
         oid_list.extend(oids)

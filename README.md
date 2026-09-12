@@ -273,6 +273,25 @@ python working_space/infer.py \
     --ckpt output/model_YYMMDD_HHMM/best_unet.pth
 ```
 
+`--ckpt` accepts several checkpoints; they are averaged with equal weight. The
+strongest validated submission uses every run's `best_ema.pth` **and**
+`best_unet.pth` (6 checkpoints, 111.49 m/s on the shared holdout vs 121.10 for
+the best single model):
+
+```powershell
+python working_space/infer.py --test_dir path\to\test --out submission.csv `
+    --ckpt output\all\model_260909_0834\best_ema.pth `
+           output\all\model_260909_0834\best_unet.pth `
+           output\all\model_260910_1213\best_ema.pth `
+           output\all\model_260910_1213\best_unet.pth `
+           output\all\model_260911_2049\best_ema.pth `
+           output\all\model_260911_2049\best_unet.pth
+```
+
+See **[INFERENCE_WINDOWS.md](INFERENCE_WINDOWS.md)** for the full Windows
+walkthrough (environment setup, test-data layout, validation commands,
+troubleshooting).
+
 ### Recommended memory-safe training settings
 
 On Kaggle with limited host memory, prefer:
