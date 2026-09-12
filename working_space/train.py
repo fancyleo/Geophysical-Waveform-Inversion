@@ -350,15 +350,19 @@ def train_worker(local_rank, world_size, args):
         )
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                                   sampler=train_sampler, num_workers=args.num_workers,
-                                  pin_memory=use_pin_memory)
+                                  pin_memory=use_pin_memory,
+                                  persistent_workers=args.num_workers > 0)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size,
                                 sampler=val_sampler, num_workers=args.num_workers,
-                                pin_memory=use_pin_memory)
+                                pin_memory=use_pin_memory,
+                                persistent_workers=args.num_workers > 0)
     else:
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                                  num_workers=args.num_workers, pin_memory=use_pin_memory)
+                                  num_workers=args.num_workers, pin_memory=use_pin_memory,
+                                  persistent_workers=args.num_workers > 0)
         val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                                  num_workers=args.num_workers, pin_memory=use_pin_memory)
+                                  num_workers=args.num_workers, pin_memory=use_pin_memory,
+                                  persistent_workers=args.num_workers > 0)
 
     # Build the model; optionally initialize weights from a previous run.
     model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels,

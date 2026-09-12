@@ -195,3 +195,37 @@ def source_dropout(seismic, velocity, rng, prob=0.3, **kwargs):
         seismic = seismic.copy()
         seismic[src] = 0.0
     return seismic, velocity
+
+
+@register_aug("velocity_scale")
+def velocity_scale(seismic, velocity, rng, prob=0.5, alpha_max=0.1,
+                   amplitude_exponent=0.26, **kwargs):
+    """Scale the velocity model and time-warp the seismic traces accordingly.
+
+    Ruby (14th place) augmentation: multiply the target velocity model by
+    ``1 + alpha`` and compress the seismic time axis by the same factor (the
+    wavefield is resampled at ``t * (1 + alpha)``). Physically, a faster medium
+    makes arrivals earlier, so the traces must be compressed in time to stay
+    consistent with the scaled velocity. Ruby reports an empirical amplitude
+    change of ``(1 + alpha) ** 0.26`` accompanying the scaling, which is applied
+    here to the raw traces before the sign*log1p preprocessing.
+    """
+    if rng.random() >= prob:
+        return seismic, velocity
+
+    factor = 1.0 + rng.uniform(-alpha_max, alpha_max)
+    n_steps = seismic.shape[1]
+    positions = np.arange(n_steps, dtype=np.float32) * np.float32(factor)
+    np.clip(positions, 0.0, n_steps - 1, out=positions)
+    lower = np.floor(positions).astype(np.int32)
+    upper = np.minimum(lower + 1, n_steps - 1)
+    weight = positions - lower
+
+    # Linear interpolation along the time axis (compress/stretch the wavefield).
+    seismic = (
+        seismic[:, lower, :] * (np.float32(1.0) - weight)[None, :, None]
+        + seismic[:, upper, :] * weight[None, :, None]
+    ).astype(np.float32, copy=False)
+    seismic = seismic * np.float32(factor ** amplitude_exponent)
+    velocity = (velocity * np.float32(factor)).astype(np.float32, copy=False)
+    return seismic, velocity
