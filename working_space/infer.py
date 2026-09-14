@@ -33,6 +33,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import UNet
 from config import Cfg, load_velocity_stats, resolve_device
+from tta import FLIP_VARIANTS, ensemble_predict
 
 # ---------------------------------------------------------------------------
 # Test dataset
@@ -76,16 +77,6 @@ def load_state(path, device):
     return state
 
 
-def ensemble_predict(batch, models):
-    """Equal-weight average of every model's prediction for one batch."""
-    if len(models) == 1:
-        return models[0](batch)
-    total = models[0](batch).float()
-    for model in models[1:]:
-        total = total + model(batch).float()
-    return total / len(models)
-
-
 # ---------------------------------------------------------------------------
 # Inference entry point
 # ---------------------------------------------------------------------------
@@ -107,6 +98,12 @@ def main():
                         choices=("auto", "cpu", "cuda"))
     parser.add_argument("--num_workers", type=int, default=Cfg.num_workers,
                         help="DataLoader workers; use 0 on Windows if it errors.")
+    parser.add_argument(
+        "--tta", choices=tuple(FLIP_VARIANTS), default="none",
+        help="Flip test-time augmentation per model before ensembling "
+             "(see tta.py; the geometry-consistent variants are src_recv / "
+             "time_recv / time_src_recv).",
+    )
     parser.add_argument(
         "--stats_path",
         default=None,
@@ -141,6 +138,7 @@ def main():
         models.append(model)
         print(f"[info] loaded checkpoint: {ckpt}")
     print(f"[info] ensemble size: {len(models)} (equal-weight average)")
+    print(f"[info] tta: {args.tta}")
 
     # Prepare the test data loader.
     ds = TestDataset(args.test_dir)
@@ -153,7 +151,7 @@ def main():
     preds = []   # Store denormalized predictions with shape (B, 70, 70).
     for oids, seis in tqdm(loader, desc="inference"):
         seis = seis.to(device)                     # (B,5,1000,70)
-        pred = ensemble_predict(seis, models)      # (B,70,70) normalized
+        pred = ensemble_predict(seis, models, args.tta)   # (B,70,70) normalized
         pred = pred.cpu().numpy() * args.vel_std + args.vel_mean
         preds.append(pred)
         oid_list.extend(oids)

@@ -17,6 +17,7 @@ Submission format: one row per oid/y position with odd x-columns only.
 import argparse
 import copy
 import gc
+import json
 import math
 import os
 import time
@@ -237,6 +238,27 @@ def main():
              "seeds so every run shares one fixed holdout (comparable val + fair "
              "ensemble eval).",
     )
+    parser.add_argument(
+        "--train_frac",
+        type=float,
+        default=1.0,
+        help="Data-scaling experiment knob: fraction of TRAIN files to keep "
+             "(1.0 = all). The val/holdout split is untouched, so different "
+             "fractions stay mutually comparable on the same holdout.",
+    )
+    parser.add_argument(
+        "--frac_seed",
+        type=int,
+        default=0,
+        help="Seed for the deterministic --train_frac file subsample.",
+    )
+    parser.add_argument(
+        "--aug_json",
+        default=None,
+        help="Optional JSON file holding an {'augmentations': {...}} override. "
+             "Use this for augmentation A/Bs so the global "
+             "output/aug_explore/winner_aug.json stays untouched.",
+    )
     args = parser.parse_args()
 
     if args.test_run:
@@ -300,7 +322,7 @@ def train_worker(local_rank, world_size, args):
             f"[start] run_dir={run_dir}  device={device}  families="
             f"{', '.join(selected_families)}  epochs={args.epochs}  "
             f"batch_size={args.batch_size}  seed={args.seed}  "
-            f"split_seed={args.split_seed}  "
+            f"split_seed={args.split_seed}  train_frac={args.train_frac}  "
             f"parallel_mode={args.parallel_mode}",
             echo=False,
         )
@@ -323,6 +345,21 @@ def train_worker(local_rank, world_size, args):
     tr_files, va_files = train_test_split(
         file_ids, test_size=Cfg.val_ratio, random_state=args.split_seed
     )
+    # Optional data-scaling: keep a deterministic subset of the TRAIN files only.
+    # The split above is untouched, so every fraction is evaluated on exactly the
+    # same val files and the fractions remain mutually comparable.
+    n_train_files = len(tr_files)
+    if args.train_frac < 1.0:
+        frac_rng = np.random.default_rng(args.frac_seed)
+        n_keep = max(1, int(round(n_train_files * args.train_frac)))
+        tr_files = sorted(
+            frac_rng.choice(np.asarray(tr_files), size=n_keep, replace=False).tolist()
+        )
+        if is_main_process() and progress is not None:
+            progress.write(
+                f"[info] train_frac={args.train_frac}: keeping {n_keep}/"
+                f"{n_train_files} train files (frac_seed={args.frac_seed})"
+            )
     tr_set = set(tr_files); va_set = set(va_files)
     tr_idx = [idx for idx in indices if idx[0] in tr_set]
     va_idx = [idx for idx in indices if idx[0] in va_set]
@@ -331,9 +368,20 @@ def train_worker(local_rank, world_size, args):
     if is_main_process():
         progress.write(f"[info] train samples: {len(tr_idx)}, val samples: {len(va_idx)}")
 
+    # Augmentations for this run: the config default, optionally overridden by
+    # --aug_json (keeps augmentation A/Bs away from the global winner_aug.json).
+    augmentations = Cfg.augmentations
+    if args.aug_json:
+        with open(args.aug_json) as aug_file:
+            augmentations = json.load(aug_file).get("augmentations", {})
+    if is_main_process() and progress is not None:
+        progress.write(
+            f"[info] augmentations: {augmentations if augmentations else '{} (none)'}"
+        )
+
     train_ds = SeisVelDataset(
         pairs, tr_idx, vel_mean=vel_mean, vel_std=vel_std,
-        augmentations=Cfg.augmentations, train=True, seed=args.seed,
+        augmentations=augmentations, train=True, seed=args.seed,
     )
     val_ds = SeisVelDataset(pairs, va_idx, vel_mean=vel_mean, vel_std=vel_std,
                             train=False)
@@ -549,6 +597,9 @@ def train_worker(local_rank, world_size, args):
         "peak_lr": args.lr,
         "seed": args.seed,
         "split_seed": args.split_seed,
+        "train_frac": args.train_frac,
+        "frac_seed": args.frac_seed,
+        "train_files_available": n_train_files,
         "amp": bool(args.amp),
         "schedule": args.schedule,
         "ema_decay": args.ema_decay,

@@ -27,6 +27,7 @@ from config import (Cfg, load_velocity_stats, select_families,  # noqa: E402
                     stats_path_for_families)
 from data import SeisVelDataset, build_flat_indices, find_pairs  # noqa: E402
 from model import UNet  # noqa: E402
+from tta import FLIP_VARIANTS, model_predict  # noqa: E402
 
 
 def load_state(path, device):
@@ -58,6 +59,11 @@ def main():
     )
     parser.add_argument("--weight", choices=("ema", "online"), default="ema",
                         help="Which checkpoint to load from each run dir.")
+    parser.add_argument(
+        "--tta", choices=tuple(FLIP_VARIANTS), default="none",
+        help="Flip test-time augmentation applied per model before ensembling "
+             "(see tta.py for the physics of each variant).",
+    )
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument(
         "--split_seed", type=int, default=Cfg.val_split_seed,
@@ -131,7 +137,7 @@ def main():
         ckpt_paths.append((str(path), model))
     if not ckpt_paths:
         raise SystemExit("No usable checkpoints were provided.")
-    print(f"[holdout] models to evaluate: {len(ckpt_paths)}")
+    print(f"[holdout] models to evaluate: {len(ckpt_paths)}  tta={args.tta}")
 
     # One deterministic pass: collect targets + per-model normalized predictions.
     targets = []
@@ -141,7 +147,9 @@ def main():
             velocity = velocity.squeeze(1) if velocity.dim() == 4 else velocity
             targets.append(velocity.float())
             for path, model in ckpt_paths:
-                per_model[path].append(model(seismic.to(device)).float().cpu())
+                per_model[path].append(
+                    model_predict(model, seismic.to(device), args.tta).float().cpu()
+                )
     targets = torch.cat(targets, dim=0)
     preds = {path: torch.cat(tensors, dim=0) for path, tensors in per_model.items()}
     del per_model

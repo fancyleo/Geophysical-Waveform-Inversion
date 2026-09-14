@@ -114,6 +114,29 @@ def xflip(seismic, velocity, rng, prob=0.5, **kwargs):
     return seismic, velocity
 
 
+@register_aug("geometry_flip")
+def geometry_flip(seismic, velocity, rng, prob=0.5, **kwargs):
+    """Reflect the acquisition: reverse the source channel axis AND the receiver
+    axis, and mirror the velocity model.
+
+    Physical basis (verified with the forward simulator, 2026-09-14): mirroring
+    the acquisition about the receiver-array centre maps receiver j -> 71-j, so
+    source i moves to the mirrored position of source 6-i -- the source *channel
+    order* must therefore be reversed too. Measured symmetry fidelity:
+    ``corr(flip(sim(v)), sim(mirror(v))) = 0.959`` versus ``0.910`` for the
+    unflipped control, the residual coming from the centre source sitting one
+    cell (10 m) off the mirror of ``[1, 18, 35, 53, 70]`` -> ``[70, 53, 36, 18, 1]``.
+
+    NOTE: this supersedes ``xflip``, which reversed only the receiver axis and
+    left the source channels in place, thereby mispairing inputs with the
+    mirrored label (a plausible cause of its earlier "harmful" verdict).
+    """
+    if rng.random() < prob:
+        seismic = seismic[::-1, :, ::-1]   # source axis + receiver axis
+        velocity = velocity[:, ::-1]
+    return seismic, velocity
+
+
 @register_aug("time_shift")
 def time_shift(seismic, velocity, rng, prob=0.5, max_shift=100, **kwargs):
     """Shift the time axis (source excitation delay) with zero padding.
