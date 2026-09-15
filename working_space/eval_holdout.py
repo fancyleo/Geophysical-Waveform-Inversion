@@ -18,6 +18,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 
@@ -64,6 +65,13 @@ def main():
         help="Flip test-time augmentation applied per model before ensembling "
              "(see tta.py for the physics of each variant).",
     )
+    parser.add_argument(
+        "--family_report", action="store_true",
+        help="Also print holdout MAE broken down by data family. Essential when "
+             "comparing runs trained on different family mixes (e.g. after the "
+             "fault families were completed), where the overall val MAE confounds "
+             "model quality with holdout composition.",
+    )
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument(
         "--split_seed", type=int, default=Cfg.val_split_seed,
@@ -93,6 +101,24 @@ def main():
     del indices
     print(f"[holdout] files={len(pairs)}  holdout files={len(va_files)}  "
           f"holdout samples={len(va_idx)}")
+
+    # Per-family bookkeeping: which family each holdout sample came from. The
+    # family name is a path component (vel families live under
+    # <Family>/data/*.npy, fault families directly under <Family>/*.npy), so walk
+    # up the path instead of taking the immediate parent directory.
+    family_names = set(families)
+
+    def family_of(path):
+        for part in reversed(Path(path).parts):
+            if part in family_names:
+                return part
+        return "unknown"
+
+    family_of_file = {}
+    for file_index, _ in va_idx:
+        if file_index not in family_of_file:
+            family_of_file[file_index] = family_of(pairs[file_index][0])
+    sample_families = [family_of_file[file_index] for file_index, _ in va_idx]
 
     holdout_ds = SeisVelDataset(pairs, va_idx, vel_mean=vel_mean, vel_std=vel_std,
                                 train=False)
@@ -126,8 +152,13 @@ def main():
     ckpt_paths = []
     for entry in entries:
         p = Path(entry)
-        path = p if p.is_file() else (p / ("best_ema.pth" if args.weight == "ema"
-                                           else "best_unet.pth"))
+        # Treat anything that looks like a checkpoint file as a file, even if a
+        # transient stat failure makes is_file() return False -- otherwise the
+        # path is silently re-suffixed into "<file>/best_ema.pth" and skipped.
+        if p.suffix == ".pth" or p.is_file():
+            path = p
+        else:
+            path = p / ("best_ema.pth" if args.weight == "ema" else "best_unet.pth")
         if not path.is_file():
             print(f"[skip] checkpoint not found: {path}")
             continue
@@ -159,7 +190,7 @@ def main():
 
     def label(path):
         p = Path(path)
-        return f"{p.parent.name}/{p.name}" if p.is_file() else f"{p.name}"
+        return f"{p.parent.name}/{p.name}"
 
     print("\n=== Single-model holdout MAE (m/s) ===")
     single = {}
@@ -196,6 +227,37 @@ def main():
         print(f"  holdout MAE = {raw_mae(ensemble_pred(chosen)):.2f} m/s")
     else:
         print("\nNo ensemble improved over the best single model.")
+
+    if args.family_report:
+        fam_arr = np.array(sample_families)
+
+        def short(path):
+            p = Path(path)
+            run = p.parent.name
+            tag = run[-4:] if run.startswith("model_") else run[:4]
+            return f"{tag}{'e' if 'ema' in p.name else 'u'}"
+
+        def fam_mae(pred, fam):
+            mask = torch.from_numpy(fam_arr == fam)
+            return (pred[mask] - targets[mask]).abs().mean().item() * vel_std
+
+        columns = [(short(k), preds[k]) for k in preds]
+        if chosen:
+            columns.append((f"ens{len(chosen)}", ensemble_pred(chosen)))
+        # Hardest family first, ranked by the widest column (ensemble if present).
+        fams = sorted(set(sample_families),
+                      key=lambda f: -fam_mae(columns[-1][1], f))
+
+        print("\n=== Per-family holdout MAE (m/s) ===")
+        print(f"  {'family':<15}{'n':>7}  " + "".join(f"{name:>8}" for name, _ in columns))
+        for fam in fams:
+            row = "".join(f"{fam_mae(pred, fam):>8.2f}" for _, pred in columns)
+            n = int((fam_arr == fam).sum())
+            print(f"  {fam:<15}{n:>7}  {row}")
+        totals = "".join(
+            f"{(pred - targets).abs().mean().item() * vel_std:>8.2f}" for _, pred in columns
+        )
+        print(f"  {'ALL':<15}{len(sample_families):>7}  {totals}")
 
 
 if __name__ == "__main__":
