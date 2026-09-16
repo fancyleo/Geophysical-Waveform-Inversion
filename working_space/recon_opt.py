@@ -29,7 +29,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import Cfg, resolve_device
-from model import UNet
+from model import build_model, resolve_model_spec
 from forward_model import vel_to_seis
 
 
@@ -151,7 +151,10 @@ if __name__ == "__main__":
 
     models = []
     for ck in ckpt_list:
-        m = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(device)
+        spec_model, spec_act, spec_out = resolve_model_spec(ck)
+        m = build_model(name=spec_model, in_ch=Cfg.n_src,
+                        base=Cfg.model_base_channels, act=spec_act,
+                        out_activation=spec_out).to(device)
         state = torch.load(ck, map_location=device, weights_only=False)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]

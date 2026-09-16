@@ -96,6 +96,21 @@ def augment_sample(seismic, velocity, config, seed=0):
 # Tier 1 - geometry augmentations (low risk, highest value)
 # ---------------------------------------------------------------------------
 
+def _mirror_receiver_axis(velocity):
+    """Mirror the receiver (x) axis of a velocity label.
+
+    The datasets store velocity with a leading channel axis -- ``(1, 70, 70)`` at
+    the dataset level, squeezed to ``(70, 70)`` before the loss -- so the
+    receiver/x axis is the **last** axis in both layouts. Index with ``...``
+    rather than ``[:, ::-1]``: on a ``(1, 70, 70)`` array the latter mirrors the
+    *depth* axis, which silently mislabels every augmented sample. That bug
+    (fixed 2026-09-16) made the ``geometry_flip`` arm train on half-mislabelled
+    data, produced a catastrophic flip-TTA result, and had earlier turned the
+    ``xflip`` verdict into a false negative.
+    """
+    return velocity[..., ::-1]
+
+
 @register_aug("xflip")
 def xflip(seismic, velocity, rng, prob=0.5, **kwargs):
     """Mirror the receiver axis and the matching velocity axis.
@@ -104,13 +119,14 @@ def xflip(seismic, velocity, rng, prob=0.5, **kwargs):
     position is a valid acquisition geometry, so flipping the waveform
     left-right and mirroring the velocity model yields a realistic new sample.
 
-    NOTE: assumes ``velocity[:, i]`` varies along the receiver (horizontal)
-    axis. If a visualization shows the horizontal axis is the first dimension,
-    change the velocity flip to ``velocity[::-1, :]``.
+    NOTE: this reverses only the receiver axis, so it is *not* a physical
+    symmetry of this acquisition (the source positions are fixed and the source
+    channel order is left untouched) -- see ``geometry_flip`` for the version that
+    is consistent with the mirrored label.
     """
     if rng.random() < prob:
         seismic = seismic[..., ::-1]
-        velocity = velocity[:, ::-1]
+        velocity = _mirror_receiver_axis(velocity)
     return seismic, velocity
 
 
@@ -133,7 +149,7 @@ def geometry_flip(seismic, velocity, rng, prob=0.5, **kwargs):
     """
     if rng.random() < prob:
         seismic = seismic[::-1, :, ::-1]   # source axis + receiver axis
-        velocity = velocity[:, ::-1]
+        velocity = _mirror_receiver_axis(velocity)
     return seismic, velocity
 
 

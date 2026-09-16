@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import (Cfg, load_velocity_stats, select_families,  # noqa: E402
                     stats_path_for_families)
 from data import SeisVelDataset, build_flat_indices, find_pairs  # noqa: E402
-from model import UNet  # noqa: E402
+from model import MODEL_NAMES, ACT_NAMES, build_model, resolve_model_spec  # noqa: E402
 from tta import FLIP_VARIANTS, model_predict  # noqa: E402
 
 
@@ -64,6 +64,16 @@ def main():
         "--tta", choices=tuple(FLIP_VARIANTS), default="none",
         help="Flip test-time augmentation applied per model before ensembling "
              "(see tta.py for the physics of each variant).",
+    )
+    parser.add_argument(
+        "--model", choices=("auto",) + MODEL_NAMES, default="auto",
+        help="Architecture override. 'auto' (default) reads model_type from each "
+             "checkpoint's results.json / config.json.",
+    )
+    parser.add_argument(
+        "--act", choices=("auto",) + ACT_NAMES, default="auto",
+        help="Hidden-activation override. 'auto' reads it from the run metadata, "
+             "defaulting to 'relu' for runs saved before 2026-09-15.",
     )
     parser.add_argument(
         "--family_report", action="store_true",
@@ -162,9 +172,20 @@ def main():
         if not path.is_file():
             print(f"[skip] checkpoint not found: {path}")
             continue
-        model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels).to(device)
+        # Architecture comes from the run metadata: newer runs record model_type /
+        # act, older ones fall back to the original ReLU U-Net.
+        spec_model, spec_act, spec_out = resolve_model_spec(str(path))
+        if args.model != "auto":
+            spec_model = args.model
+        if args.act != "auto":
+            spec_act = args.act
+        model = build_model(name=spec_model, in_ch=Cfg.n_src,
+                            base=Cfg.model_base_channels,
+                            act=spec_act, out_activation=spec_out).to(device)
         model.load_state_dict(load_state(str(path), device))
         model.eval()
+        print(f"[info] {Path(path).parent.name}/{Path(path).name}: "
+              f"model={spec_model} act={spec_act}")
         ckpt_paths.append((str(path), model))
     if not ckpt_paths:
         raise SystemExit("No usable checkpoints were provided.")

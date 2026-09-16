@@ -193,6 +193,17 @@ class Cfg:
     val_ratio = 0.1
     model_base_channels = 32
 
+    # Architecture. "unet" = the original U-Net, "seisunet" = the asymmetric
+    # time-compression U-Net from working_space/seisunet.md. `activation` applies
+    # to hidden layers: "leaky_relu" (current default; six of the eight checkpoints
+    # in output/all were trained with "relu", which stays selectable so those runs
+    # remain reproducible).
+    model_name = "unet"
+    activation = "leaky_relu"
+    # "none" matches this project's z-scored targets; "tanh" is only for
+    # experiments that MinMax-scale the target to [-1, 1].
+    out_activation = "none"
+
     # Per working_space/unet conclusions: the model is capacity/data-limited, not
     # overfitting-dominated, so keep AdamW's default L2 (1e-2) and no dropout.
     # These stay configurable via train.py --weight_decay / --dropout.

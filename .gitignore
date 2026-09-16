@@ -49,3 +49,6 @@ working_space/*.ipynb
 
 # community solutions
 working_space/community_solution
+
+# sh scripts
+working_space/*.sh

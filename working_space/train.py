@@ -34,7 +34,7 @@ from sklearn.model_selection import train_test_split
 
 from config import Cfg, load_velocity_stats, resolve_device, select_families, stats_path_for_families
 from data import SeisVelDataset, build_flat_indices, find_pairs
-from model import UNet
+from model import MODEL_NAMES, ACT_NAMES, build_model
 from training import (
     cleanup_ddp,
     get_rank,
@@ -259,6 +259,27 @@ def main():
              "Use this for augmentation A/Bs so the global "
              "output/aug_explore/winner_aug.json stays untouched.",
     )
+    parser.add_argument(
+        "--model",
+        choices=MODEL_NAMES,
+        default=Cfg.model_name,
+        help="Architecture: 'unet' (original, symmetric 3x3 kernels) or "
+             "'seisunet' (asymmetric time-compression U-Net, see seisunet.md).",
+    )
+    parser.add_argument(
+        "--act",
+        choices=ACT_NAMES,
+        default=Cfg.activation,
+        help="Hidden activation. 'leaky_relu' is the current default; pass 'relu' "
+             "to reproduce checkpoints trained before 2026-09-15.",
+    )
+    parser.add_argument(
+        "--out_activation",
+        choices=("none", "tanh"),
+        default=Cfg.out_activation,
+        help="Output activation. 'none' matches this project's z-scored targets; "
+             "'tanh' assumes a MinMax[-1, 1] target.",
+    )
     args = parser.parse_args()
 
     if args.test_run:
@@ -413,8 +434,19 @@ def train_worker(local_rank, world_size, args):
                                   persistent_workers=args.num_workers > 0)
 
     # Build the model; optionally initialize weights from a previous run.
-    model = UNet(in_ch=Cfg.n_src, base=Cfg.model_base_channels,
-                 dropout=args.dropout).to(device)
+    model = build_model(
+        name=args.model,
+        in_ch=Cfg.n_src,
+        base=Cfg.model_base_channels,
+        dropout=args.dropout,
+        act=args.act,
+        out_activation=args.out_activation,
+    ).to(device)
+    if is_main_process() and progress is not None:
+        progress.write(
+            f"[info] model: {args.model}  act: {args.act}  "
+            f"out_activation: {args.out_activation}"
+        )
     if args.resume:
         state_dict = _load_resume_state(args.resume, device)
         model.load_state_dict(state_dict)
@@ -611,7 +643,9 @@ def train_worker(local_rank, world_size, args):
         "world_size": world_size,
         "rank": get_rank(),
         "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-        "model": "UNet",
+        "model_type": args.model,
+        "act": args.act,
+        "out_activation": args.out_activation,
         "model_base_channels": Cfg.model_base_channels,
         "parameter_count": n_params,
         "train_files": len(tr_files),
