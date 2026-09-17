@@ -323,14 +323,17 @@ def build_model(name=None, in_ch=Cfg.n_src, base=None, dropout=0.0, act=None,
 
 
 def resolve_model_spec(ckpt_path):
-    """Infer ``(model_name, act, out_activation)`` from a checkpoint's run dir.
+    """Infer ``(model_name, act, out_activation, base)`` from a checkpoint's run dir.
 
-    ``train.py`` records ``model_type`` / ``act`` / ``out_activation`` in the run
-    metadata. Runs saved before those fields existed used the original ReLU
-    U-Net, so they fall back to ``("unet", "relu", "none")`` -- which is what
+    ``train.py`` records ``model_type`` / ``act`` / ``out_activation`` /
+    ``model_base_channels`` in the run metadata. Runs saved before those fields
+    existed used the original ReLU U-Net at the default width, so they fall back
+    to ``("unet", "relu", "none", Cfg.model_base_channels)`` -- which is what
     keeps the pre-2026-09 checkpoints loadable with the architecture they were
-    trained with.
+    trained with. Returns a 4-tuple; callers that only need the first three can
+    unpack ``spec[:3]``.
     """
+    default_base = Cfg.model_base_channels
     run_dir = Path(ckpt_path).resolve().parent
     for meta_name in ("results.json", "config.json"):
         meta_path = run_dir / meta_name
@@ -344,6 +347,9 @@ def resolve_model_spec(ckpt_path):
         model_name = meta.get("model_type") or argv.get("model")
         act = meta.get("act") or argv.get("act")
         out_activation = meta.get("out_activation") or argv.get("out_activation")
+        base = meta.get("model_base_channels") or argv.get("base_channels")
+        base = int(base) if base else default_base
         if model_name or act or out_activation:
-            return (model_name or "unet", act or "relu", out_activation or "none")
-    return ("unet", "relu", "none")
+            return (model_name or "unet", act or "relu",
+                    out_activation or "none", base)
+    return ("unet", "relu", "none", default_base)

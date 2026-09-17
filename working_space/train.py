@@ -280,6 +280,14 @@ def main():
         help="Output activation. 'none' matches this project's z-scored targets; "
              "'tanh' assumes a MinMax[-1, 1] target.",
     )
+    parser.add_argument(
+        "--base_channels",
+        type=int,
+        default=Cfg.model_base_channels,
+        help="Model width (base channel count). 32 is the reference; larger values "
+             "add capacity (48 = 2.25x params, 64 = 4x). Recorded in the run "
+             "metadata so eval/infer rebuild the exact architecture.",
+    )
     args = parser.parse_args()
 
     if args.test_run:
@@ -437,7 +445,7 @@ def train_worker(local_rank, world_size, args):
     model = build_model(
         name=args.model,
         in_ch=Cfg.n_src,
-        base=Cfg.model_base_channels,
+        base=args.base_channels,
         dropout=args.dropout,
         act=args.act,
         out_activation=args.out_activation,
@@ -445,7 +453,7 @@ def train_worker(local_rank, world_size, args):
     if is_main_process() and progress is not None:
         progress.write(
             f"[info] model: {args.model}  act: {args.act}  "
-            f"out_activation: {args.out_activation}"
+            f"out_activation: {args.out_activation}  base={args.base_channels}"
         )
     if args.resume:
         state_dict = _load_resume_state(args.resume, device)
@@ -646,7 +654,7 @@ def train_worker(local_rank, world_size, args):
         "model_type": args.model,
         "act": args.act,
         "out_activation": args.out_activation,
-        "model_base_channels": Cfg.model_base_channels,
+        "model_base_channels": args.base_channels,
         "parameter_count": n_params,
         "train_files": len(tr_files),
         "validation_files": len(va_files),

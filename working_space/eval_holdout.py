@@ -6,8 +6,14 @@ trained with that split never saw the holdout files. It reports per-model raw
 MAE on the shared holdout and runs greedy forward ensemble selection (equal
 weight mean of predictions), which is the repo's validated integration lever.
 
-Usage (run from working_space; WAVEFORM_OUTPUT_ROOT should point at repo/output
-so the shared velocity-statistics JSON is found):
+Metrics are computed in RAW m/s: every checkpoint is denormalised with the
+velocity statistics of ITS OWN run directory (`velocity_stats.json`, written by
+train.py), falling back to the shared stats JSON / Cfg defaults when absent.
+Mixing conventions is what makes cross-run comparisons valid -- runs launched
+without WAVEFORM_OUTPUT_ROOT trained against Cfg.vel_mean/Cfg.vel_std
+(2916.82 / 817.36) instead of the shared file (2905.50 / 792.22).
+
+Usage (run from working_space):
     python eval_holdout.py \\
         --ckpts output/all/model_260909_xxxx output/all/model_260909_yyyy ... \\
         [--weight ema|online] [--batch_size 32] [--split_seed 777]
@@ -174,40 +180,57 @@ def main():
             continue
         # Architecture comes from the run metadata: newer runs record model_type /
         # act, older ones fall back to the original ReLU U-Net.
-        spec_model, spec_act, spec_out = resolve_model_spec(str(path))
+        spec_model, spec_act, spec_out, spec_base = resolve_model_spec(str(path))
         if args.model != "auto":
             spec_model = args.model
         if args.act != "auto":
             spec_act = args.act
         model = build_model(name=spec_model, in_ch=Cfg.n_src,
-                            base=Cfg.model_base_channels,
+                            base=spec_base,
                             act=spec_act, out_activation=spec_out).to(device)
         model.load_state_dict(load_state(str(path), device))
         model.eval()
+
+        # Each run must be denormalised with the statistics IT was trained with.
+        # Runs launched with WAVEFORM_OUTPUT_ROOT pointing at a directory holding
+        # the shared stats JSON used (2905.50, 792.22), while runs that fell back
+        # to Cfg defaults trained in (2916.82, 817.36). Scoring both with one
+        # constant silently mis-scales one of them, so the run's own
+        # velocity_stats.json (written by train.py) wins when present.
+        run_stats = Path(path).parent / "velocity_stats.json"
+        ckpt_mean, ckpt_std = vel_mean, vel_std
+        if run_stats.is_file():
+            ckpt_mean, ckpt_std = load_velocity_stats(run_stats)
+        if abs(ckpt_std - vel_std) > 1e-6:
+            print(f"[warn] {Path(path).parent.name} was trained with "
+                  f"std={ckpt_std:.2f}/mean={ckpt_mean:.2f} but the shared stats "
+                  f"are std={vel_std:.2f}/mean={vel_mean:.2f}; using the run's own.")
         print(f"[info] {Path(path).parent.name}/{Path(path).name}: "
-              f"model={spec_model} act={spec_act}")
-        ckpt_paths.append((str(path), model))
+              f"model={spec_model} act={spec_act} base={spec_base} "
+              f"norm=(mean={ckpt_mean:.2f}, std={ckpt_std:.2f})")
+        ckpt_paths.append((str(path), model, ckpt_mean, ckpt_std))
     if not ckpt_paths:
         raise SystemExit("No usable checkpoints were provided.")
     print(f"[holdout] models to evaluate: {len(ckpt_paths)}  tta={args.tta}")
 
-    # One deterministic pass: collect targets + per-model normalized predictions.
+    # One deterministic pass: collect targets + per-model predictions, both in
+    # RAW m/s. Averaging in raw space is also what infer.py does, so ensembles
+    # stay valid across differing normalisation conventions.
     targets = []
-    per_model = {path: [] for path, _ in ckpt_paths}
+    per_model = {path: [] for path, _, _, _ in ckpt_paths}
     with torch.no_grad():
         for seismic, velocity in loader:
             velocity = velocity.squeeze(1) if velocity.dim() == 4 else velocity
-            targets.append(velocity.float())
-            for path, model in ckpt_paths:
-                per_model[path].append(
-                    model_predict(model, seismic.to(device), args.tta).float().cpu()
-                )
+            targets.append(velocity.float() * vel_std + vel_mean)
+            for path, model, ckpt_mean, ckpt_std in ckpt_paths:
+                out = model_predict(model, seismic.to(device), args.tta).float().cpu()
+                per_model[path].append(out * ckpt_std + ckpt_mean)
     targets = torch.cat(targets, dim=0)
     preds = {path: torch.cat(tensors, dim=0) for path, tensors in per_model.items()}
     del per_model
 
     def raw_mae(tensor):
-        return (tensor - targets).abs().mean().item() * vel_std
+        return (tensor - targets).abs().mean().item()
 
     def label(path):
         p = Path(path)
@@ -260,7 +283,7 @@ def main():
 
         def fam_mae(pred, fam):
             mask = torch.from_numpy(fam_arr == fam)
-            return (pred[mask] - targets[mask]).abs().mean().item() * vel_std
+            return (pred[mask] - targets[mask]).abs().mean().item()
 
         columns = [(short(k), preds[k]) for k in preds]
         if chosen:
@@ -276,7 +299,7 @@ def main():
             n = int((fam_arr == fam).sum())
             print(f"  {fam:<15}{n:>7}  {row}")
         totals = "".join(
-            f"{(pred - targets).abs().mean().item() * vel_std:>8.2f}" for _, pred in columns
+            f"{(pred - targets).abs().mean().item():>8.2f}" for _, pred in columns
         )
         print(f"  {'ALL':<15}{len(sample_families):>7}  {totals}")
 

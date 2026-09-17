@@ -140,21 +140,34 @@ def main():
     print(f"[info] device: {device}")
 
     # Load one or more trained models (equal-weight ensemble when several).
+    # Denormalisation constants are resolved PER checkpoint: runs launched
+    # without WAVEFORM_OUTPUT_ROOT trained against Cfg.vel_mean/Cfg.vel_std
+    # instead of the shared stats file, so a single global constant would
+    # mis-scale those members. An explicit --stats_path still forces one pair.
     models = []
+    inverse_scales = []
     for ckpt in args.ckpt:
-        spec_model, spec_act, spec_out = resolve_model_spec(ckpt)
+        spec_model, spec_act, spec_out, spec_base = resolve_model_spec(ckpt)
         if args.model != "auto":
             spec_model = args.model
         if args.act != "auto":
             spec_act = args.act
         model = build_model(name=spec_model, in_ch=Cfg.n_src,
-                            base=Cfg.model_base_channels,
+                            base=spec_base,
                             act=spec_act, out_activation=spec_out).to(device)
         model.load_state_dict(load_state(ckpt, device))
         model.eval()
         models.append(model)
+
+        ckpt_mean, ckpt_std = args.vel_mean, args.vel_std
+        if not args.stats_path:
+            run_stats = Path(ckpt).resolve().parent / "velocity_stats.json"
+            if run_stats.is_file():
+                ckpt_mean, ckpt_std = load_velocity_stats(run_stats)
+        inverse_scales.append((ckpt_mean, ckpt_std))
         print(f"[info] loaded checkpoint: {ckpt} "
-              f"(model={spec_model} act={spec_act})")
+              f"(model={spec_model} act={spec_act} base={spec_base} "
+              f"norm=(mean={ckpt_mean:.2f}, std={ckpt_std:.2f}))")
     print(f"[info] ensemble size: {len(models)} (equal-weight average)")
     print(f"[info] tta: {args.tta}")
 
@@ -169,9 +182,10 @@ def main():
     preds = []   # Store denormalized predictions with shape (B, 70, 70).
     for oids, seis in tqdm(loader, desc="inference"):
         seis = seis.to(device)                     # (B,5,1000,70)
-        pred = ensemble_predict(seis, models, args.tta)   # (B,70,70) normalized
-        pred = pred.cpu().numpy() * args.vel_std + args.vel_mean
-        preds.append(pred)
+        # ensemble_predict with scales averages in RAW m/s (see tta.py).
+        pred = ensemble_predict(seis, models, args.tta,
+                                scales=inverse_scales)   # (B,70,70) raw m/s
+        preds.append(pred.cpu().numpy())
         oid_list.extend(oids)
 
     preds = np.concatenate(preds, axis=0)          # (N, 70, 70)

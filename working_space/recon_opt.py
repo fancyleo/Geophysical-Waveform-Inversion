@@ -151,9 +151,9 @@ if __name__ == "__main__":
 
     models = []
     for ck in ckpt_list:
-        spec_model, spec_act, spec_out = resolve_model_spec(ck)
+        spec_model, spec_act, spec_out, spec_base = resolve_model_spec(ck)
         m = build_model(name=spec_model, in_ch=Cfg.n_src,
-                        base=Cfg.model_base_channels, act=spec_act,
+                        base=spec_base, act=spec_act,
                         out_activation=spec_out).to(device)
         state = torch.load(ck, map_location=device, weights_only=False)
         if isinstance(state, dict) and "state_dict" in state:

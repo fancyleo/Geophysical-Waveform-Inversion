@@ -48,11 +48,20 @@ def model_predict(model, batch, tta="none"):
     return 0.5 * (out + torch.flip(flipped, dims=(-1,)))
 
 
-def ensemble_predict(batch, models, tta="none"):
-    """Equal-weight average of every model's (optionally TTA'd) prediction."""
-    if len(models) == 1:
-        return model_predict(models[0], batch, tta)
-    total = model_predict(models[0], batch, tta).float()
-    for model in models[1:]:
-        total = total + model_predict(model, batch, tta).float()
+def ensemble_predict(batch, models, tta="none", scales=None):
+    """Equal-weight average of every model's (optionally TTA'd) prediction.
+
+    ``scales`` (optional) is a per-model list of ``(mean, std)`` denormalisation
+    constants. Providing it averages in RAW velocity space, which is required
+    when the members were trained under different normalisation conventions
+    (see eval_holdout.py / infer.py). Without it the average happens in whatever
+    normalized space the models output, which is only safe for homogeneous runs.
+    """
+    total = None
+    for index, model in enumerate(models):
+        out = model_predict(model, batch, tta).float()
+        if scales is not None:
+            mean, std = scales[index]
+            out = out * std + mean
+        total = out if total is None else total + out
     return total / len(models)
