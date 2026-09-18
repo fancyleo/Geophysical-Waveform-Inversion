@@ -655,6 +655,11 @@ def train_worker(local_rank, world_size, args):
         "act": args.act,
         "out_activation": args.out_activation,
         "model_base_channels": args.base_channels,
+        # Record the augmentation ACTUALLY used (plus its override path). Without
+        # this a run's artifacts look identical to an unaugmented one -- the only
+        # trace was the training log banner.
+        "augmentations": augmentations,
+        "aug_json": args.aug_json,
         "parameter_count": n_params,
         "train_files": len(tr_files),
         "validation_files": len(va_files),

@@ -272,6 +272,13 @@ def main():
     else:
         print("\nNo ensemble improved over the best single model.")
 
+    # Reference point for the greedy search: averaging EVERY candidate with equal
+    # weight. This is what a naive "use all checkpoints" pipeline ships, so it
+    # must be reported to show whether the selection actually bought anything.
+    if len(preds) > 1:
+        every = raw_mae(ensemble_pred(list(preds)))
+        print(f"\nAll {len(preds)} checkpoints, equal weight: {every:.2f} m/s")
+
     if args.family_report:
         fam_arr = np.array(sample_families)
 
