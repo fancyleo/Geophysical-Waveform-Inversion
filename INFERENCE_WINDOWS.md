@@ -116,14 +116,14 @@ python infer.py `
 | `--batch_size` | 4 | raise to 16–32 on a GPU, lower to 2 if you hit OOM |
 | `--device` | `auto` | `auto` / `cuda` / `cpu` |
 | `--num_workers` | 2 | **use `0` on Windows** if you hit DataLoader errors |
-| `--stats_path` | checkpoint dir | velocity-normalization JSON (see §6) |
+| `--stats_path` | *(omitted)* | **Usually omit it.** When omitted, every checkpoint is denormalised with the `velocity_stats.json` of **its own run folder** (correct for mixed ensembles). Passing it forces that one mean/std pair onto every member. |
 
 ### Expected console output
 
 ```
-[info] loaded velocity statistics: D:\models\model_260910_1213\velocity_stats.json
+[info] per-checkpoint velocity statistics (fallback mean=2916.82 std=817.36)
 [info] device: cuda
-[info] loaded checkpoint: D:\models\model_260910_1213\best_ema.pth
+[info] loaded checkpoint: D:\models\model_260910_1213\best_ema.pth (model=seisunet act=leaky_relu base=32 norm=(mean=2916.82, std=817.36) from run)
 ...
 [info] ensemble size: 6 (equal-weight average)
 [info] test files: <N>
@@ -165,20 +165,34 @@ the sample file, which is the safest thing to submit.
 
 ## 6. Velocity statistics — do not skip this
 
-`infer.py` denormalizes with `pred * vel_std + vel_mean`, loaded from
-`velocity_stats.json` **in the directory of the first `--ckpt`**:
+`infer.py` denormalizes **each** checkpoint with `pred * std + mean`, resolved
+per checkpoint in this priority order:
+
+1. `--stats_path`, if you pass it (forces that one pair onto every member);
+2. `velocity_stats.json` in the checkpoint's own run folder — **the normal case**;
+3. `--vel_mean` / `--vel_std`, defaulting to `2916.82` / `817.36`.
+
+Every checkpoint prints the pair it will use **and where it came from**:
 
 ```
-mean = 2905.50
-std  = 792.22
+[info] loaded checkpoint: D:\models\model_260916_2244\best_ema.pth (model=seisunet act=leaky_relu base=32 norm=(mean=2916.82, std=817.36) from run)
 ```
 
-- If that file is missing you will see
-  `[warn] no statistics JSON at ...; using --vel_mean/--vel_std`, and the
-  predictions will be wrong (the built-in defaults are stale, from the old
-  6-family dataset).
-- Fix: keep `velocity_stats.json` next to the `.pth` files (as shipped), or pass
-  `--stats_path D:\models\model_260910_1213\velocity_stats.json`.
+| source | meaning |
+|---|---|
+| `from run` | read from that checkpoint's own folder — what you want |
+| `from fallback` | no `velocity_stats.json` there, so the CLI/Cfg pair was used; correct **only** if the model was trained with those constants (this series was) |
+| `from forced` | you passed `--stats_path`, so every member shares one pair |
+
+> ⚠️ **This project has two different pairs in its history.** Runs launched
+> without `WAVEFORM_OUTPUT_ROOT` set silently fell back to the Cfg defaults
+> (**2916.82 / 817.36**, recomputed on the fp16 pool), while runs from before
+> loaded the shared stats file (**2905.50 / 792.22**, kept from the pre-fp16
+> pool). Scoring a run with the other pair mis-scales every prediction — it once
+> turned a 71.29 m/s run into a reported 81.04.
+>
+> **Do:** ship `velocity_stats.json` next to the `.pth` files and leave
+> `--stats_path` unset, so each member uses its own constants.
 
 ---
 
