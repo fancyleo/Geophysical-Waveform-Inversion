@@ -117,33 +117,37 @@ def main():
     parser.add_argument(
         "--stats_path",
         default=None,
-        help="Optional velocity-statistics JSON path; defaults to the directory "
-             "of the first checkpoint (velocity_stats.json is stored there by "
-             "train.py).",
+        help="Optional velocity-statistics JSON. When given it FORCES that single "
+             "mean/std pair onto every checkpoint. When omitted (recommended) "
+             "each checkpoint is denormalised with the velocity_stats.json of its "
+             "own run directory, falling back to --vel_mean/--vel_std.",
     )
     args = parser.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
-    stats_path = (
-        Path(args.stats_path)
-        if args.stats_path
-        else Path(args.ckpt[0]).resolve().parent / "velocity_stats.json"
-    )
-    if stats_path.is_file():
-        args.vel_mean, args.vel_std = load_velocity_stats(stats_path)
-        print(f"[info] loaded velocity statistics: {stats_path}")
+    # Denormalisation constants, resolved PER checkpoint with this priority:
+    #   1. an explicit --stats_path, which forces ONE pair onto every member;
+    #   2. velocity_stats.json in the checkpoint's own run directory;
+    #   3. the --vel_mean/--vel_std given on the command line (Cfg defaults).
+    # The CLI pair is captured BEFORE any file is read: otherwise the first
+    # checkpoint's file would silently become the fallback for all the others.
+    cli_mean, cli_std = args.vel_mean, args.vel_std
+    if args.stats_path:
+        forced = load_velocity_stats(args.stats_path)
+        print(f"[info] forcing one statistics pair ({args.stats_path}) on every "
+              f"checkpoint: mean={forced[0]:.2f} std={forced[1]:.2f}")
     else:
-        print(f"[warn] no statistics JSON at {stats_path}; using --vel_mean/--vel_std "
-              f"({args.vel_mean:.2f}/{args.vel_std:.2f})")
+        forced = None
+        print(f"[info] per-checkpoint velocity statistics "
+              f"(fallback mean={cli_mean:.2f} std={cli_std:.2f})")
 
     device = resolve_device(args.device)
     print(f"[info] device: {device}")
 
     # Load one or more trained models (equal-weight ensemble when several).
-    # Denormalisation constants are resolved PER checkpoint: runs launched
-    # without WAVEFORM_OUTPUT_ROOT trained against Cfg.vel_mean/Cfg.vel_std
-    # instead of the shared stats file, so a single global constant would
-    # mis-scale those members. An explicit --stats_path still forces one pair.
+    # Each member is denormalised with its own constants and the ensemble
+    # averages in RAW m/s (see tta.py::ensemble_predict), so members trained in
+    # different normalisation spaces still combine correctly.
     models = []
     inverse_scales = []
     for ckpt in args.ckpt:
@@ -159,15 +163,18 @@ def main():
         model.eval()
         models.append(model)
 
-        ckpt_mean, ckpt_std = args.vel_mean, args.vel_std
-        if not args.stats_path:
-            run_stats = Path(ckpt).resolve().parent / "velocity_stats.json"
-            if run_stats.is_file():
-                ckpt_mean, ckpt_std = load_velocity_stats(run_stats)
+        run_stats = Path(ckpt).resolve().parent / "velocity_stats.json"
+        if forced is not None:
+            ckpt_mean, ckpt_std, norm_src = forced[0], forced[1], "forced"
+        elif run_stats.is_file():
+            ckpt_mean, ckpt_std = load_velocity_stats(run_stats)
+            norm_src = "run"
+        else:
+            ckpt_mean, ckpt_std, norm_src = cli_mean, cli_std, "fallback"
         inverse_scales.append((ckpt_mean, ckpt_std))
         print(f"[info] loaded checkpoint: {ckpt} "
               f"(model={spec_model} act={spec_act} base={spec_base} "
-              f"norm=(mean={ckpt_mean:.2f}, std={ckpt_std:.2f}))")
+              f"norm=(mean={ckpt_mean:.2f}, std={ckpt_std:.2f}) from {norm_src})")
     print(f"[info] ensemble size: {len(models)} (equal-weight average)")
     print(f"[info] tta: {args.tta}")
 
