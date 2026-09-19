@@ -263,8 +263,11 @@ def main():
         "--model",
         choices=MODEL_NAMES,
         default=Cfg.model_name,
-        help="Architecture: 'unet' (original, symmetric 3x3 kernels) or "
-             "'seisunet' (asymmetric time-compression U-Net, see seisunet.md).",
+        help="Architecture: 'unet' (original, symmetric 3x3 kernels), 'seisunet' "
+             "(asymmetric time-compression U-Net, see seisunet.md) or 'caformer' "
+             "(ImageNet-22k pretrained timm backbone + PixelShuffle/SCSE decoder, "
+             "see community_solution/brendanartley.md; needs timm+monai and is "
+             "several times more expensive per epoch).",
     )
     parser.add_argument(
         "--act",

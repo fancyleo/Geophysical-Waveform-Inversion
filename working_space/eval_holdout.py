@@ -187,7 +187,8 @@ def main():
             spec_act = args.act
         model = build_model(name=spec_model, in_ch=Cfg.n_src,
                             base=spec_base,
-                            act=spec_act, out_activation=spec_out).to(device)
+                            act=spec_act, out_activation=spec_out,
+                            pretrained=False).to(device)
         model.load_state_dict(load_state(str(path), device))
         model.eval()
 

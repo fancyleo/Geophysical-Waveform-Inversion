@@ -154,7 +154,7 @@ if __name__ == "__main__":
         spec_model, spec_act, spec_out, spec_base = resolve_model_spec(ck)
         m = build_model(name=spec_model, in_ch=Cfg.n_src,
                         base=spec_base, act=spec_act,
-                        out_activation=spec_out).to(device)
+                        out_activation=spec_out, pretrained=False).to(device)
         state = torch.load(ck, map_location=device, weights_only=False)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
