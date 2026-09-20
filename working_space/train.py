@@ -206,7 +206,10 @@ def main():
         "--parallel_mode",
         choices=("single", "data_parallel", "ddp"),
         default=Cfg.parallel_mode,
-        help="Parallel backend; data_parallel supports the current multi-GPU workflow.",
+        help="'data_parallel' and 'ddp' are ALIASES: both run through "
+             "DistributedDataParallel and need --nproc_per_node >= 2. Without it "
+             "they silently degrade to single-GPU. There is no nn.DataParallel "
+             "code path.",
     )
     parser.add_argument(
         "--family",
@@ -232,7 +235,9 @@ def main():
         "--nproc_per_node",
         type=int,
         default=1,
-        help="Number of processes to spawn for DDP (multi-GPU).",
+        help="Processes to spawn for multi-GPU DDP. Must be >= 2 for "
+             "--parallel_mode ddp/data_parallel to do anything (default 1 = "
+             "single GPU).",
     )
     parser.add_argument(
         "--resume",
@@ -403,6 +408,13 @@ def main():
             join=True,
         )
     else:
+        if args.parallel_mode in ("data_parallel", "ddp"):
+            print(
+                f"[warn] --parallel_mode {args.parallel_mode} has no effect with "
+                f"--nproc_per_node {args.nproc_per_node}: only one process is "
+                f"spawned, so this runs on a SINGLE GPU. Pass "
+                f"--nproc_per_node 2 (or more) for multi-GPU DDP."
+            )
         train_worker(0, 1, args)
 
 
@@ -517,15 +529,18 @@ def train_worker(local_rank, world_size, args):
         train_sampler = DistributedSampler(
             train_ds, num_replicas=world_size, rank=get_rank(), shuffle=True
         )
-        val_sampler = DistributedSampler(
-            val_ds, num_replicas=world_size, rank=get_rank(), shuffle=False
-        )
         train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                                   sampler=train_sampler, num_workers=args.num_workers,
                                   pin_memory=use_pin_memory,
                                   persistent_workers=args.num_workers > 0)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size,
-                                sampler=val_sampler, num_workers=args.num_workers,
+        # Validation is deliberately NOT sharded. A DistributedSampler would give
+        # each rank half of the frozen holdout and nothing reduces the loss across
+        # ranks, so the logged val would silently become a half-holdout metric --
+        # not comparable with any recorded run. Every rank evaluates the whole
+        # holdout instead: they run concurrently on their own GPUs, so the extra
+        # cost is GPU time, not wall-clock.
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers,
                                 pin_memory=use_pin_memory,
                                 persistent_workers=args.num_workers > 0)
     else:
@@ -642,7 +657,11 @@ def train_worker(local_rank, world_size, args):
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     ema_state = None
     ema_model = None
-    if args.ema_decay and args.ema_decay > 0 and not distributed:
+    # EMA is available under DDP too: the all-reduce keeps every rank's parameters
+    # identical, so each rank's EMA tracks the same weights and rank 0 owns the
+    # artifact. Disabling it (the previous behaviour) silently dropped the best
+    # checkpoint -- EMA beats the online weights by 3-6 m/s on this task.
+    if args.ema_decay and args.ema_decay > 0:
         base_model = unwrap_model(model)
         if resume_extras.get("ema_state_dict") is not None:
             ema_state = {k: v.detach().to(device).clone()
