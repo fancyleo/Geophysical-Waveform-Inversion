@@ -81,11 +81,14 @@ def unwrap_model(model):
 
 
 def _run_epoch(model, loader, criterion, device, optimizer=None,
-               use_amp=False, scaler=None, ema_update=None):
+               use_amp=False, scaler=None, ema_update=None, amp_dtype=None):
     """Run one epoch; optimize when ``optimizer`` is given, otherwise validate.
 
     ``use_amp``/``scaler`` enable mixed-precision training steps; ``ema_update``
     (if given) is invoked after every optimizer step to refresh EMA weights.
+    ``amp_dtype`` selects the autocast dtype (``torch.bfloat16`` for bf16, which
+    is faster and avoids fp16 overflow on transformer-hybrid backbones); ``None``
+    keeps PyTorch's per-device default (fp16 on CUDA).
     """
     if optimizer is not None:
         model.train()
@@ -93,7 +96,10 @@ def _run_epoch(model, loader, criterion, device, optimizer=None,
         model.eval()
 
     device_type = getattr(device, "type", str(device))
-    autocast = torch.autocast(device_type=device_type, enabled=bool(use_amp))
+    autocast_kwargs = {"device_type": device_type, "enabled": bool(use_amp)}
+    if amp_dtype is not None:
+        autocast_kwargs["dtype"] = amp_dtype
+    autocast = torch.autocast(**autocast_kwargs)
     total, count = 0.0, 0
     progress = tqdm(loader, desc="train" if optimizer else "valid", leave=False)
     for seismic, velocity in progress:
@@ -105,7 +111,9 @@ def _run_epoch(model, loader, criterion, device, optimizer=None,
             loss = criterion(prediction, velocity)
 
         if optimizer is not None:
-            optimizer.zero_grad()
+            # set_to_none=True releases the gradient buffers instead of zeroing
+            # them -- measurably cheaper per step on small-batch workloads.
+            optimizer.zero_grad(set_to_none=True)
             if use_amp and scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -127,10 +135,11 @@ def _run_epoch(model, loader, criterion, device, optimizer=None,
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device,
-                    use_amp=False, scaler=None, ema_update=None):
+                    use_amp=False, scaler=None, ema_update=None, amp_dtype=None):
     """Run one training epoch and return the sample-weighted mean loss."""
     return _run_epoch(model, loader, criterion, device, optimizer=optimizer,
-                      use_amp=use_amp, scaler=scaler, ema_update=ema_update)
+                      use_amp=use_amp, scaler=scaler, ema_update=ema_update,
+                      amp_dtype=amp_dtype)
 
 
 @torch.no_grad()
