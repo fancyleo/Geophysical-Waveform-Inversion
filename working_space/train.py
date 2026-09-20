@@ -103,25 +103,87 @@ class ProgressLogger:
             print(message)
 
 
-def _load_resume_state(path, device):
-    """Load a model state_dict from a checkpoint, normalizing common formats.
+def _unwrap_state(checkpoint):
+    """Return the bare model state_dict from a checkpoint of any supported shape.
 
     Accepts a bare state_dict (as saved by this repo's ``best_unet.pth``) or a
     dict that wraps it under ``model`` / ``model_state_dict`` / ``state_dict``.
     Keys prefixed with ``module.`` (DataParallel) are stripped so the state
-    matches a bare ``UNet``.
+    matches the unwrapped model.
     """
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
     if isinstance(checkpoint, dict):
         for key in ("model_state_dict", "state_dict", "model"):
             if key in checkpoint and isinstance(checkpoint[key], dict):
                 checkpoint = checkpoint[key]
                 break
     if not isinstance(checkpoint, dict):
-        raise ValueError(f"Unsupported checkpoint format: {path}")
+        raise ValueError("Unsupported checkpoint format (no state_dict found)")
     if any(key.startswith("module.") for key in checkpoint):
         checkpoint = {key[len("module."):]: value for key, value in checkpoint.items()}
     return checkpoint
+
+
+# Everything a `train_state.pt` may carry beyond the weights. Restoring these is
+# what makes --resume a true continuation instead of a warm restart.
+RESUME_EXTRA_KEYS = (
+    "optimizer_state_dict", "ema_state_dict", "epoch",
+    "best_val", "best_epoch", "ema_best_val", "ema_best_epoch",
+    "history", "ema_history",
+)
+
+
+def _load_resume_state(path, device):
+    """Load just the model state_dict (weights-only warm restart)."""
+    return _unwrap_state(torch.load(path, map_location=device, weights_only=True))
+
+
+def _load_resume_checkpoint(path, device):
+    """Load a checkpoint as ``(model_state, extras)``.
+
+    ``extras`` collects whatever else the file stores -- optimizer moments, EMA
+    weights, the last completed epoch and the metric history -- so ``--resume``
+    can continue the optimisation exactly where it stopped. Legacy checkpoints
+    (a bare state_dict, or ``best_ema.pth`` / ``best_unet.pth``) carry none of
+    those and yield an empty ``extras``, which keeps their old weights-only
+    behaviour.
+    """
+    raw = torch.load(path, map_location=device, weights_only=True)
+    extras = {}
+    if isinstance(raw, dict):
+        for key in RESUME_EXTRA_KEYS:
+            if key in raw and raw[key] is not None:
+                extras[key] = raw[key]
+    return _unwrap_state(raw), extras
+
+
+def _save_train_state(path, model, optimizer, ema_state, epoch, best_val,
+                      best_epoch, ema_best_val, ema_best_epoch, history,
+                      ema_history):
+    """Write the full optimizer/EMA/epoch state so ``--resume`` can continue.
+
+    Written every epoch to ``train_state.pt`` (separate from the shipped
+    ``best_*.pth`` weights, which stay small for inference). The size is ~3x the
+    weights because AdamW keeps two fp32 moment tensors per parameter -- cheap
+    insurance against losing a multi-day run.
+
+    Written atomically via a temp file + rename: a half-written state file would
+    make ``--resume`` fail on a corrupt checkpoint, which is worse than absent.
+    """
+    payload = {
+        "model_state_dict": unwrap_model(model).state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "ema_state_dict": ema_state,
+        "epoch": epoch,
+        "best_val": best_val,
+        "best_epoch": best_epoch,
+        "ema_best_val": ema_best_val,
+        "ema_best_epoch": ema_best_epoch,
+        "history": history,
+        "ema_history": ema_history,
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +237,26 @@ def main():
     parser.add_argument(
         "--resume",
         default=None,
-        help="Path to a state_dict checkpoint (e.g. a previous run's "
-             "best_unet.pth) used to initialize weights and continue training.",
+        help="Checkpoint to continue training from. A full `train_state.pt` "
+             "restores the weights AND the AdamW moments, the EMA weights, the "
+             "completed-epoch counter (so the LR schedule continues rather than "
+             "restarting at the peak) and the best-so-far metrics. A legacy "
+             "weights-only file (best_ema.pth / best_unet.pth) still works but "
+             "behaves as a warm restart -- see --resume_weights_only.",
+    )
+    parser.add_argument(
+        "--resume_weights_only",
+        action="store_true",
+        help="Ignore any optimizer/EMA/epoch state in --resume and start with "
+             "fresh Adam moments at the peak LR. Use this deliberately for a "
+             "warm restart; without it, a resume from a fresh-moment optimizer "
+             "shocks an already-converged model off its minimum.",
+    )
+    parser.add_argument(
+        "--no_save_train_state",
+        action="store_true",
+        help="Do not write train_state.pt each epoch. That file is what makes a "
+             "crashed multi-day run resumable, so only disable it to save disk.",
     )
     parser.add_argument(
         "--lr",
@@ -470,11 +550,19 @@ def train_worker(local_rank, world_size, args):
             f"[info] model: {args.model}  act: {args.act}  "
             f"out_activation: {args.out_activation}  base={args.base_channels}"
         )
+    resume_extras = {}
     if args.resume:
-        state_dict = _load_resume_state(args.resume, device)
+        state_dict, resume_extras = _load_resume_checkpoint(args.resume, device)
+        if args.resume_weights_only:
+            resume_extras = {}
         model.load_state_dict(state_dict)
-        if progress is not None:
-            progress.write(f"[info] resumed weights from {args.resume}")
+        if is_main_process() and progress is not None:
+            restored = sorted(resume_extras)
+            progress.write(
+                f"[info] resumed weights from {args.resume}"
+                + (f"  (also found: {', '.join(restored)})" if restored
+                   else "  (weights only)")
+            )
     model, resolved_parallel_mode = wrap_model_for_parallel(
         model, args.parallel_mode, device, world_size
     )
@@ -485,6 +573,27 @@ def train_worker(local_rank, world_size, args):
     # A lower peak LR is recommended when resuming an already-trained model.
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay)
+    # Restore the AdamW moments before the schedule is built: without them every
+    # parameter's second moment is re-estimated from scratch, the bias
+    # correction makes the first updates ~lr-sized, and a converged model is
+    # kicked off its minimum (observed: val 36.9 -> 48.1 in one epoch).
+    if resume_extras.get("optimizer_state_dict") is not None:
+        try:
+            optimizer.load_state_dict(resume_extras["optimizer_state_dict"])
+            for state in optimizer.state.values():
+                for key, value in state.items():
+                    if torch.is_tensor(value):
+                        state[key] = value.to(device)
+            if is_main_process():
+                progress.write(
+                    "[info] restored AdamW moments (true continuation)"
+                )
+        except Exception as exc:  # shape/arch mismatch -> keep fresh moments
+            if is_main_process():
+                progress.write(
+                    f"[warn] could not restore optimizer state ({exc}); "
+                    f"continuing with fresh Adam moments"
+                )
     if args.schedule == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs
@@ -506,23 +615,49 @@ def train_worker(local_rank, world_size, args):
         )
     criterion = nn.L1Loss()  # MAE in normalized target units.
 
+    # Epoch counter: a real resume continues the schedule, it does not restart it.
+    # --epochs is the TOTAL budget, so resuming an 10-epoch checkpoint with
+    # --epochs 30 runs epochs 11..30 and evaluates the schedule at those indices.
+    start_epoch = int(resume_extras.get("epoch", 0)) + 1
+    if start_epoch > args.epochs:
+        raise SystemExit(
+            f"--resume reports epoch {start_epoch - 1} already done but --epochs "
+            f"is only {args.epochs}. Pass a larger --epochs (it is the whole "
+            f"budget the schedule spans), or use --resume_weights_only to start "
+            f"a fresh {args.epochs}-epoch schedule from these weights."
+        )
+    if start_epoch > 1:
+        # The scheduler is constructed with last_epoch=0 (LR for index 0); epoch
+        # E consumes index E-1, so advance to index start_epoch-1.
+        for _ in range(start_epoch - 1):
+            scheduler.step()
+        if is_main_process():
+            progress.write(
+                f"[info] continuing at epoch {start_epoch}/{args.epochs} "
+                f"(lr={optimizer.param_groups[0]['lr']:.3g})"
+            )
+
     # Mixed precision (AMP) + optional EMA weight averaging.
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
     ema_state = None
     ema_model = None
-    ema_best_val = float("inf")
-    ema_best_epoch = None
-    ema_history = []
     if args.ema_decay and args.ema_decay > 0 and not distributed:
         base_model = unwrap_model(model)
-        ema_state = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
+        if resume_extras.get("ema_state_dict") is not None:
+            ema_state = {k: v.detach().to(device).clone()
+                         for k, v in resume_extras["ema_state_dict"].items()}
+        else:
+            ema_state = {k: v.detach().clone()
+                         for k, v in base_model.state_dict().items()}
         ema_model = copy.deepcopy(base_model)
         ema_model.eval()
         if progress is not None:
+            src = ("restored from checkpoint" if "ema_state_dict" in resume_extras
+                   else "initialised from the model weights")
             progress.write(
                 f"[info] EMA enabled (decay={args.ema_decay}) "
-                f"with {len(ema_state)} state tensors"
+                f"with {len(ema_state)} state tensors ({src})"
             )
 
     def _ema_update():
@@ -535,13 +670,20 @@ def train_worker(local_rank, world_size, args):
                 if name in ema_state and value.is_floating_point():
                     ema_state[name].mul_(decay).add_(value.detach(), alpha=1.0 - decay)
 
-    best_val = float("inf")
-    best_epoch = None
+    best_val = float(resume_extras.get("best_val", float("inf")))
+    best_epoch = resume_extras.get("best_epoch")
     no_improve_epochs = 0
-    history = []
+    # Carry the history forward so the run's artifacts describe the whole
+    # trajectory and a resumed run cannot overwrite a better best_*.pth.
+    history = list(resume_extras.get("history") or [])
+    ema_best_val = float(resume_extras.get("ema_best_val", float("inf")))
+    ema_best_epoch = resume_extras.get("ema_best_epoch")
+    ema_history = list(resume_extras.get("ema_history") or [])
     memory_series = []
     rss_baseline = current_rss_mb()
-    for epoch in range(1, args.epochs + 1):
+    if is_main_process() and resume_extras and not args.no_save_train_state:
+        progress.write(f"[info] resumable state -> {run_dir / 'train_state.pt'}")
+    for epoch in range(start_epoch, args.epochs + 1):
         if distributed and hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
         tr_loss = train_one_epoch(
@@ -606,6 +748,13 @@ def train_worker(local_rank, world_size, args):
                         run_dir / "best_ema.pth",
                     )
                     progress.write(f"  saved best EMA (val_mae_raw={ema_va_raw:.2f})")
+
+        # Full resumable state: AdamW moments + EMA + epoch + history. Separate
+        # from best_*.pth so the shipped inference weights stay small.
+        if is_main_process() and not args.no_save_train_state:
+            _save_train_state(run_dir / "train_state.pt", model, optimizer,
+                              ema_state, epoch, best_val, best_epoch,
+                              ema_best_val, ema_best_epoch, history, ema_history)
 
         # Early stopping: stop once val has not improved for `patience` epochs.
         stop_now = args.patience > 0 and no_improve_epochs >= args.patience
