@@ -14,6 +14,17 @@ Equal-weight multi-checkpoint ensemble (the repo's validated best recipe --
                            run_c/best_ema.pth run_c/best_unet.pth \
                     --test_dir D:/data/test --out submission.csv
 
+Multi-GPU (one OS process per GPU; the test set is sharded BY FILE and the parts
+are merged back into the original file order, so the result matches a
+single-process run -- mirrors train.py's flag):
+    python infer.py --ckpt run/best_ema.pth --test_dir D:/data/test \
+                    --out submission.csv --nproc_per_node 2
+
+The same sharding can be driven by hand (e.g. one shell per GPU), in which case
+each process writes its own file and nothing is merged automatically:
+    CUDA_VISIBLE_DEVICES=0 python infer.py ... --shard_index 0 --shard_count 2 \
+                              --out part0.csv
+
 Output format (matching sample_submission.csv):
   oid_ypos,x_1,x_3,...,x_69
   000039dca2_y_0,3000.0,3000.0,...,3000.0
@@ -23,10 +34,11 @@ Output format (matching sample_submission.csv):
 import os
 import glob
 import argparse
+import subprocess
 from pathlib import Path
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm.auto import tqdm
 
 import sys
@@ -34,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import MODEL_NAMES, ACT_NAMES, build_model, resolve_model_spec
 from config import Cfg, load_velocity_stats, resolve_device
 from tta import FLIP_VARIANTS, ensemble_predict
+
 
 # ---------------------------------------------------------------------------
 # Test dataset
@@ -78,11 +91,67 @@ def load_state(path, device):
 
 
 # ---------------------------------------------------------------------------
+# Submission writing
+# ---------------------------------------------------------------------------
+SUBMISSION_HEADER = (
+    "oid_ypos,x_1,x_3,x_5,x_7,x_9,x_11,x_13,x_15,x_17,x_19,"
+    "x_21,x_23,x_25,x_27,x_29,x_31,x_33,x_35,x_37,x_39,"
+    "x_41,x_43,x_45,x_47,x_49,x_51,x_53,x_55,x_57,x_59,"
+    "x_61,x_63,x_65,x_67,x_69\n"
+)
+
+
+def write_submission(out_path, oid_list, preds):
+    """Write predictions in the Kaggle format (odd x-columns only).
+
+    ``preds`` has shape (N, 70, 70); the first axis is ``y`` (depth) and the
+    second is ``x`` (receiver position), matching submission row ``<oid>_y_<y>``.
+    """
+    odd_cols = preds[:, :, Cfg.submission_x_start:Cfg.submission_x_stop:Cfg.submission_x_step]
+    with open(out_path, "w") as f:
+        f.write(SUBMISSION_HEADER)
+        for i, oid in enumerate(oid_list):
+            for y in range(odd_cols.shape[1]):     # 70 rows
+                row_vals = ",".join(f"{v:.1f}" for v in odd_cols[i, y])
+                f.write(f"{oid}_y_{y},{row_vals}\n")
+
+
+def merge_submission_parts(out_path, part_paths, ordered_oids):
+    """Concatenate the per-rank part files into one submission file.
+
+    Rows are emitted in ``ordered_oids`` order (the test directory's sorted file
+    order), NOT in shard order, so the merged file is indistinguishable from a
+    single-process run. Each object is predicted by exactly one rank, so a
+    missing key means a shard died -- that raises instead of writing a file that
+    would silently score badly.
+    """
+    rows = {}
+    for part in part_paths:
+        if not os.path.isfile(part):
+            continue
+        with open(part) as f:
+            next(f, None)                          # skip the header
+            for line in f:
+                oid = line.split(",", 1)[0].rsplit("_y_", 1)[0]
+                rows.setdefault(oid, []).append(line)
+    missing = [oid for oid in ordered_oids if oid not in rows]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} of {len(ordered_oids)} test objects were not "
+            f"predicted (e.g. {missing[:3]}); refusing to write a partial "
+            f"submission -- check the shard logs above."
+        )
+    with open(out_path, "w") as f:
+        f.write(SUBMISSION_HEADER)
+        for oid in ordered_oids:
+            f.writelines(rows[oid])
+
+
+# ---------------------------------------------------------------------------
 # Inference entry point
 # ---------------------------------------------------------------------------
-@torch.no_grad()
 def main():
-    """Run inference and write predictions in Kaggle submission format."""
+    """Parse arguments, then infer on one process (or one process per GPU)."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ckpt", nargs="+", default=[str(Cfg.checkpoint_path)],
@@ -122,8 +191,110 @@ def main():
              "each checkpoint is denormalised with the velocity_stats.json of its "
              "own run directory, falling back to --vel_mean/--vel_std.",
     )
+    parser.add_argument(
+        "--nproc_per_node", type=int, default=1,
+        help="Number of processes, one per GPU (mirrors train.py's flag). "
+             "1 (default) = the original single-process run. N > 1 shards the "
+             "test set by file across N GPUs and merges the part files back into "
+             "the original order, so predictions match the single-process run. "
+             "Falls back to 1 when CUDA is unavailable or fewer GPUs are visible.",
+    )
+    parser.add_argument(
+        "--shard_index", type=int, default=-1,
+        help="Run only THIS shard of the test set (0-based). Normally set by "
+             "--nproc_per_node, which launches one process per GPU; you can also "
+             "run the shards yourself (see the module docstring). Each shard "
+             "writes its own --out file and nothing is merged for you.",
+    )
+    parser.add_argument(
+        "--shard_count", type=int, default=1,
+        help="Total number of shards the test set is split into (with "
+             "--shard_index).",
+    )
     args = parser.parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+
+    if args.shard_index >= 0:
+        # Worker mode: one shard, launched by --nproc_per_node or by hand.
+        count = max(1, args.shard_count)
+        if not 0 <= args.shard_index < count:
+            raise SystemExit(f"--shard_index {args.shard_index} is outside "
+                             f"--shard_count {count}")
+        infer_worker(args.shard_index, count, args)
+        return
+
+    nproc = max(1, int(args.nproc_per_node))
+    if nproc > 1 and resolve_device(args.device).type != "cuda":
+        print(f"[warn] --nproc_per_node {nproc} needs CUDA (got --device "
+              f"{args.device}); running a single process.")
+        nproc = 1
+    if nproc > 1:
+        available = torch.cuda.device_count()
+        if nproc > available:
+            print(f"[warn] --nproc_per_node {nproc} exceeds the {available} "
+                  f"visible GPU(s); using {available}.")
+            nproc = max(1, available)
+
+    if nproc == 1:
+        infer_worker(0, 1, args)
+        return
+
+    # One OS process per GPU, each pinned with CUDA_VISIBLE_DEVICES=<rank>. Rank r
+    # predicts every nproc-th test file into its own part file; main() merges the
+    # parts in the original file order, so the submission matches the
+    # single-process run (unlike DataParallel, no sample is split across
+    # processes).
+    #
+    # subprocess rather than torch.multiprocessing.spawn(): spawn switches the
+    # multiprocessing start method, so the DataLoader workers are recreated with a
+    # fresh interpreter every time and the loader starves the loop -- measured
+    # 6.2 it/s per rank that way vs 21 it/s for the same shard run as an
+    # independent process. A forked mp.spawn is also unsafe here because the
+    # parent has already initialised CUDA (resolve_device / device_count).
+    part_paths = [f"{args.out}.part{rank}" for rank in range(nproc)]
+    script = str(Path(__file__).resolve())
+    children = []
+    for rank in range(nproc):
+        cmd = [sys.executable, script, *sys.argv[1:],
+               "--shard_index", str(rank), "--shard_count", str(nproc),
+               "--out", part_paths[rank]]
+        print(f"[info] shard {rank + 1}/{nproc} on GPU {rank}")
+        children.append(subprocess.Popen(cmd, env=dict(os.environ,
+                                                       CUDA_VISIBLE_DEVICES=str(rank))))
+    codes = [child.wait() for child in children]
+    if any(codes):
+        raise SystemExit(f"shard processes failed (exit codes {codes}); part "
+                         f"files kept for debugging, nothing was merged")
+
+    ordered_oids = TestDataset(args.test_dir).oids
+    merge_submission_parts(args.out, part_paths, ordered_oids)
+    for path in part_paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    print(f"[done] saved → {args.out} (merged {nproc} shards, "
+          f"{len(ordered_oids)} objects)")
+
+
+@torch.no_grad()
+def infer_worker(local_rank, world_size, args):
+    """Run inference over this rank's shard of the test set.
+
+    ``world_size == 1`` is the plain single-process path. ``world_size > 1`` runs
+    one shard (files ``local_rank``, ``local_rank + world_size``, ...) on the GPU
+    named by ``CUDA_VISIBLE_DEVICES`` and writes it to this shard's --out file;
+    the launcher merges the parts afterwards.
+    """
+    sharded = world_size > 1
+    device = resolve_device(args.device)
+    if sharded and device.type == "cuda":
+        # The launcher pins this process with CUDA_VISIBLE_DEVICES=<rank>, so its
+        # only visible device is 0.
+        torch.cuda.set_device(0)
+    tag = f"[r{local_rank}] " if sharded else ""
+    print(f"{tag}[info] device: {device} "
+          f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')})")
 
     # Denormalisation constants, resolved PER checkpoint with this priority:
     #   1. an explicit --stats_path, which forces ONE pair onto every member;
@@ -134,15 +305,12 @@ def main():
     cli_mean, cli_std = args.vel_mean, args.vel_std
     if args.stats_path:
         forced = load_velocity_stats(args.stats_path)
-        print(f"[info] forcing one statistics pair ({args.stats_path}) on every "
+        print(f"{tag}[info] forcing one statistics pair ({args.stats_path}) on every "
               f"checkpoint: mean={forced[0]:.2f} std={forced[1]:.2f}")
     else:
         forced = None
-        print(f"[info] per-checkpoint velocity statistics "
+        print(f"{tag}[info] per-checkpoint velocity statistics "
               f"(fallback mean={cli_mean:.2f} std={cli_std:.2f})")
-
-    device = resolve_device(args.device)
-    print(f"[info] device: {device}")
 
     # Load one or more trained models (equal-weight ensemble when several).
     # Each member is denormalised with its own constants and the ensemble
@@ -173,14 +341,32 @@ def main():
         else:
             ckpt_mean, ckpt_std, norm_src = cli_mean, cli_std, "fallback"
         inverse_scales.append((ckpt_mean, ckpt_std))
-        print(f"[info] loaded checkpoint: {ckpt} "
+        print(f"{tag}[info] loaded checkpoint: {ckpt} "
               f"(model={spec_model} act={spec_act} base={spec_base} "
               f"norm=(mean={ckpt_mean:.2f}, std={ckpt_std:.2f}) from {norm_src})")
-    print(f"[info] ensemble size: {len(models)} (equal-weight average)")
-    print(f"[info] tta: {args.tta}")
+    print(f"{tag}[info] ensemble size: {len(models)} (equal-weight average)")
+    print(f"{tag}[info] tta: {args.tta}")
+
+    # Shard the test set: rank r takes files r, r+world_size, r+2*world_size, ...
+    full = TestDataset(args.test_dir)
+    if sharded:
+        index = list(range(local_rank, len(full), world_size))
+        print(f"{tag}[info] shard {local_rank + 1}/{world_size}: {len(index)} "
+              f"of {len(full)} test files")
+        ds = Subset(full, index)
+    else:
+        ds = full
+
+    # The launcher passes this process its own --out (a part file that the parent
+    # merges); running a shard by hand keeps whatever --out the user gave.
+    out_path = args.out
+    if len(ds) == 0:                       # fewer test files than processes
+        write_submission(out_path, [],
+                         np.zeros((0, Cfg.img_size, Cfg.img_size), dtype=np.float32))
+        print(f"{tag}[done] empty shard → {out_path}")
+        return
 
     # Prepare the test data loader.
-    ds = TestDataset(args.test_dir)
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
     )
@@ -188,7 +374,8 @@ def main():
     # Generate velocity predictions.
     oid_list = []
     preds = []   # Store denormalized predictions with shape (B, 70, 70).
-    for oids, seis in tqdm(loader, desc="inference"):
+    desc = f"inference r{local_rank}" if sharded else "inference"
+    for oids, seis in tqdm(loader, desc=desc):
         seis = seis.to(device)                     # (B,5,1000,70)
         # ensemble_predict with scales averages in RAW m/s (see tta.py).
         pred = ensemble_predict(seis, models, args.tta,
@@ -197,21 +384,10 @@ def main():
         oid_list.extend(oids)
 
     preds = np.concatenate(preds, axis=0)          # (N, 70, 70)
-    print(f"[info] predictions shape: {preds.shape}")
+    print(f"{tag}[info] predictions shape: {preds.shape}")
 
-    # Write the submission using only odd x-columns.
-    odd_cols = preds[:, :, Cfg.submission_x_start:Cfg.submission_x_stop:Cfg.submission_x_step]
-    out_path = args.out
-    with open(out_path, "w") as f:
-        f.write("oid_ypos,x_1,x_3,x_5,x_7,x_9,x_11,x_13,x_15,x_17,x_19,"
-                "x_21,x_23,x_25,x_27,x_29,x_31,x_33,x_35,x_37,x_39,"
-                "x_41,x_43,x_45,x_47,x_49,x_51,x_53,x_55,x_57,x_59,"
-                "x_61,x_63,x_65,x_67,x_69\n")
-        for i, oid in enumerate(oid_list):
-            for y in range(odd_cols.shape[1]):     # 70 rows
-                row_vals = ",".join(f"{v:.1f}" for v in odd_cols[i, y])
-                f.write(f"{oid}_y_{y},{row_vals}\n")
-    print(f"[done] saved → {out_path}")
+    write_submission(out_path, oid_list, preds)
+    print(f"{tag}[done] saved → {out_path}")
 
 
 if __name__ == "__main__":
